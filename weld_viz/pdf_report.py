@@ -13,7 +13,8 @@ from reportlab.pdfgen import canvas
 
 from .model import Classifier, Node
 from .scenario import DIRECTIONS, Scenario
-from .scene import COLOR_FIXTURE, COLOR_MOVABLE, COLOR_PART_DONE, COLOR_PART_NEW, SceneBuilder
+from .scene import (COLOR_FIXTURE, COLOR_MOVABLE, COLOR_PART_DONE, COLOR_PART_NEW, COLOR_REMOVED,
+                    SceneBuilder)
 
 FONT, FONT_BOLD = "Helvetica", "Helvetica-Bold"
 ACCENT = "#D7262D"  # фирменный красный
@@ -110,9 +111,10 @@ def export_pdf(path: str, scenario: Scenario, cls: Classifier, scene: SceneBuild
 
         new = [by_key[k] for k in step.add if k in by_key]
         shown = [by_key[k] for k in step.show if k in by_key]
-        prev_list = scenario.steps[i - 1].show if i > 0 else []
-        prev = set(prev_list)
-        removed = [by_key[k] for k in prev_list if k not in step.show and k in by_key]
+        prev = set(scenario.steps[i - 1].show) if i > 0 else set()
+        rem_parts, rem_clamps = scenario.removed_on(i)
+        removed = ["Деталь " + _node_line(by_key[k]) for k in rem_parts if k in by_key] + \
+                  [_node_line(by_key[k]) for k in rem_clamps if k in by_key]
 
         heading("Заложить детали:")
         lines([_node_line(n) for n in new], COLOR_PART_NEW)
@@ -125,16 +127,22 @@ def export_pdf(path: str, scenario: Scenario, cls: Classifier, scene: SceneBuild
         lines([("+ " if n.key not in prev else "") + _node_line(n) for n in shown], COLOR_MOVABLE)
         if removed:
             heading("Убрать / открыть:")
-            lines([_node_line(n) for n in removed])
+            lines(removed, COLOR_REMOVED)
+            c.setFont(FONT, 8.5)
+            c.setFillColorRGB(0.42, 0.44, 0.47)
+            c.drawString(x, y + 4, "На картинке полупрозрачно, стрелка — куда убрать")
+            c.setFillColorRGB(0, 0, 0)
+            y -= 14
 
         # легенда
-        ly = M + 70
+        ly = M + 83
         c.setFont(FONT_BOLD, 9)
         c.drawString(x, ly, "Обозначения:")
         for color, text in ((COLOR_PART_NEW, "закладываемая деталь"),
                             (COLOR_PART_DONE, "уже заложенные детали"),
                             (COLOR_MOVABLE, "прижимы / подвижные элементы"),
-                            (COLOR_FIXTURE, "оснастка")):
+                            (COLOR_FIXTURE, "оснастка"),
+                            (COLOR_REMOVED, "убрать (полупрозрачно, тёмная стрелка)")):
             ly -= 13
             c.setFillColor(color)
             c.rect(x, ly - 1, 9, 9, stroke=0, fill=1)

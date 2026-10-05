@@ -4,8 +4,11 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 
-JOURNAL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "nx", "export_assembly.py")
+# в собранном exe файлы лежат в sys._MEIPASS, при запуске из исходников — в корне проекта
+_BASE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+JOURNAL = os.path.join(_BASE, "nx", "export_assembly.py")
 
 
 def find_run_journal() -> str | None:

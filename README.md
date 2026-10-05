@@ -4,8 +4,11 @@
 
 ## Запуск
 
-`run.bat`. При первом запуске создаётся `.venv` и ставятся зависимости (нужен Python 3.12, `py -3.12`).
-Можно передать файл: `run.bat сборка.prt` или `run.bat сценарий.weldviz.yaml`.
+**Готовая программа:** `dist\Osnastka\Osnastka.exe` — папку `dist\Osnastka` можно копировать
+на другие компьютеры целиком, Python не нужен. Собрать заново: `build_exe.bat` (PyInstaller, `Osnastka.spec`).
+
+**Из исходников:** `run.bat`. При первом запуске создаётся `.venv` и ставятся зависимости
+(нужен Python 3.12, `py -3.12`). Можно передать файл: `run.bat сборка.prt` или `run.bat сценарий.weldviz.yaml`.
 
 Нужен установленный NX (используется `run_journal.exe` из `%UGII_BASE_DIR%\NXBIN`).
 

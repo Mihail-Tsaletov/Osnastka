@@ -478,6 +478,10 @@ class MainWindow(QMainWindow):
         for s in self.scenario.steps:
             s.add = [k for k in s.add if k in parts]
             s.show = [k for k in s.show if k in movables]
+        # скрывать можно только детали, заложенные на более ранних этапах
+        for i, s in enumerate(self.scenario.steps):
+            earlier = {k for st in self.scenario.steps[:i] for k in st.add}
+            s.hide = [k for k in s.hide if k in earlier]
 
     # ------------------------------------------------------------- таблица
     def _fill_table(self):
@@ -543,19 +547,8 @@ class MainWindow(QMainWindow):
             part_step = part_steps.get(obj.key) if kind == PART else None
             for c, st in enumerate(steps):
                 it = t.item(r, c)
-                checked = obj.key in (st.add if kind == PART else st.show)
+                bg, tip, checked = self._cell_look(kind, obj.key, part_step, c, st, c == cur)
                 it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-                locked = kind == PART and part_step is not None and part_step != c
-                if c == cur:
-                    if checked:
-                        bg = theme.CELL_PART_ON if kind == PART else theme.CELL_MOV_ON
-                    else:
-                        bg = theme.CELL_LOCKED if locked else theme.CELL_CURRENT
-                    tip = f"Деталь закладывается на этапе {part_step + 1}" if locked else "Щёлкните, чтобы отметить"
-                else:
-                    bg = (theme.CELL_PART_ON_OTHER if kind == PART else theme.CELL_MOV_ON_OTHER) if checked \
-                        else theme.CELL_OTHER
-                    tip = f"Щёлкните, чтобы перейти к этапу {c + 1}"
                 it.setBackground(QColor(bg))
                 it.setToolTip(tip)
             vh = t.verticalHeaderItem(r)
@@ -573,6 +566,32 @@ class MainWindow(QMainWindow):
             f"Этапов: {len(steps)}.")
         self._updating = False
         self._update_step_buttons()
+
+    @staticmethod
+    def _cell_look(kind, key, part_step, c, st, current):
+        """Цвет, подсказка и галочка ячейки (строка детали/прижима, столбец этапа c)."""
+        other_tip = f"Щёлкните, чтобы перейти к этапу {c + 1}"
+        if kind == MOVABLE:
+            on = key in st.show
+            if current:
+                return (theme.CELL_MOV_ON if on else theme.CELL_CURRENT,
+                        "Щёлкните, чтобы скрыть прижим на этом этапе" if on else "Щёлкните, чтобы показать прижим", on)
+            return (theme.CELL_MOV_ON_OTHER if on else theme.CELL_OTHER), other_tip, on
+        if part_step is None:  # деталь ещё никуда не заложена
+            return (theme.CELL_CURRENT if current else theme.CELL_OTHER,
+                    "Щёлкните, чтобы заложить деталь на этом этапе" if current else other_tip, False)
+        if c == part_step:  # этап закладки
+            return (theme.CELL_PART_ON if current else theme.CELL_PART_ON_OTHER,
+                    "Деталь закладывается здесь. Щёлкните, чтобы отменить" if current else other_tip, True)
+        if c < part_step:  # деталь ещё не заложена
+            return (theme.CELL_LOCKED if current else theme.CELL_OTHER,
+                    f"Деталь закладывается на этапе {part_step + 1}" if current else other_tip, False)
+        visible = key not in st.hide  # ранее заложенная деталь
+        if current:
+            tip = (f"Заложена на этапе {part_step + 1}. Щёлкните, чтобы " +
+                   ("скрыть на этом этапе" if visible else "снова показать"))
+            return (theme.CELL_PART_SHOWN if visible else theme.CELL_CURRENT), tip, visible
+        return (theme.CELL_PART_SHOWN_OTHER if visible else theme.CELL_OTHER), other_tip, visible
 
     def _update_step_buttons(self):
         n = len(self.scenario.steps) if self.model else 0
@@ -628,12 +647,13 @@ class MainWindow(QMainWindow):
         key, kind = item.data(KEY_ROLE), item.data(KEY_KIND)
         step = self.scenario.steps[col]
         if kind == PART:
-            other = self.scenario.step_of_part(key)
-            if other is not None and other != col:
-                self.statusBar().showMessage(f"Деталь уже закладывается на этапе {other + 1}. "
-                                             f"Перейдите на него и снимите отметку.", 5000)
+            placed = self.scenario.step_of_part(key)
+            if placed is not None and placed > col:
+                self.statusBar().showMessage(f"Деталь закладывается на этапе {placed + 1}. "
+                                             f"Чтобы перенести — перейдите на него и снимите отметку.", 5000)
                 return
-            lst = step.add
+            # заложена раньше — галочка управляет видимостью на этом этапе
+            lst = step.hide if placed is not None and placed < col else step.add
         else:
             lst = step.show
         if key in lst:
@@ -684,7 +704,8 @@ class MainWindow(QMainWindow):
         steps = self.scenario.steps
         prev = steps[at - 1] if at > 0 and steps else None
         self._remember_view()
-        steps.insert(at, Step(show=list(prev.show) if prev else [], direction=prev.direction if prev else "-Z"))
+        steps.insert(at, Step(show=list(prev.show) if prev else [], hide=list(prev.hide) if prev else [],
+                              direction=prev.direction if prev else "-Z"))
         self.current_step = None
         self.mark_dirty()
         self._fill_table()

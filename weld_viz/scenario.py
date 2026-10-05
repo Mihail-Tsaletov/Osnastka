@@ -21,6 +21,7 @@ class Step:
     name: str = ""
     add: list[str] = field(default_factory=list)    # ключи деталей, закладываемых на этапе
     show: list[str] = field(default_factory=list)   # ключи прижимов/подвижных, видимых на этапе
+    hide: list[str] = field(default_factory=list)   # ранее заложенные детали, скрытые на этом этапе
     direction: str = "-Z"                           # направление закладки (стрелки)
     camera: dict | None = None                      # {position, focal_point, view_up}
 
@@ -48,6 +49,7 @@ class Scenario:
                     "name": s.name,
                     "add": list(s.add),
                     "show": list(s.show),
+                    "hide": list(s.hide) or None,
                     "direction": s.direction,
                     "camera": s.camera,
                 }.items() if v is not None}
@@ -72,9 +74,21 @@ class Scenario:
             fixture_main=d.get("fixture_main"),
             roles=dict(d.get("roles") or {}),
             steps=[Step(name=s.get("name", ""), add=list(s.get("add") or []), show=list(s.get("show") or []),
+                        hide=list(s.get("hide") or []),
                         direction=s.get("direction", "-Z"), camera=s.get("camera"))
                    for s in d.get("steps") or []],
         )
+
+    def removed_on(self, i: int) -> tuple[list[str], list[str]]:
+        """Что убирается на этапе i по сравнению с предыдущим: (детали, прижимы)."""
+        if i <= 0 or i >= len(self.steps):
+            return [], []
+        prev, cur = self.steps[i - 1], self.steps[i]
+        before_prev = [k for s in self.steps[:i - 1] for k in s.add]
+        prev_visible = [k for k in before_prev if k not in prev.hide] + list(prev.add)
+        parts = [k for k in prev_visible if k in cur.hide]
+        clamps = [k for k in prev.show if k not in cur.show]
+        return parts, clamps
 
     def step_of_part(self, key: str) -> int | None:
         for i, s in enumerate(self.steps):

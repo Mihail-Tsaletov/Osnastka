@@ -14,8 +14,10 @@ from .scenario import DIRECTIONS, Scenario
 COLOR_FIXTURE = "#9ea4ab"
 COLOR_PART_DONE = "#7D8FA3"
 COLOR_PART_NEW = "#D7262D"
-COLOR_MOVABLE = "#E9A800"
+COLOR_MOVABLE = "#2E9D5B"
 COLOR_EDGES = "#202020"
+COLOR_REMOVED = "#44474D"   # стрелка и подпись убираемого
+REMOVED_OPACITY = 0.28
 COLOR_BG = "white"
 
 DEFAULT_VIEW = np.array([0.75, -1.0, 0.85])
@@ -89,7 +91,7 @@ class SceneBuilder:
         step = scenario.steps[step_idx]
         done_keys = {k for s in scenario.steps[:step_idx] for k in s.add}
         by_key = self.model.by_key
-        done = [by_key[k] for k in done_keys if k in by_key]
+        done = [by_key[k] for k in done_keys if k in by_key and k not in step.hide]
         new = [by_key[k] for k in step.add if k in by_key]
         shown = [by_key[k] for k in step.show if k in by_key]
 
@@ -127,9 +129,40 @@ class SceneBuilder:
             label_pts.append(start)
             label_txt.append(n.short_label)
 
+        # убираемое на этапе: полупрозрачно на старом месте + стрелка наружу
+        rem_pts, rem_txt = [], []
+        rem_parts, rem_clamps = scenario.removed_on(step_idx)
+        up = np.array([0.0, 0.0, 1.0])
+        for keys, role, color in ((rem_parts, PART, COLOR_PART_DONE), (rem_clamps, MOVABLE, COLOR_MOVABLE)):
+            for k in keys:
+                n = by_key.get(k)
+                mesh, edges = self.node_mesh([n], cls, role) if n else (None, None)
+                if mesh is None:
+                    continue
+                plotter.add_mesh(mesh, color=color, opacity=REMOVED_OPACITY, smooth_shading=False)
+                if edges is not None:
+                    plotter.add_mesh(edges, color=COLOR_REMOVED, opacity=0.5, line_width=line_width)
+                if role == PART:  # деталь уходит обратно туда, откуда её закладывали
+                    placed = scenario.step_of_part(k)
+                    d_in = DIRECTIONS.get(scenario.steps[placed].direction if placed is not None else "-Z",
+                                          DIRECTIONS["-Z"])[1]
+                    out = -np.array(d_in, float)
+                else:
+                    out = up
+                length = arrow_len * (1.0 if role == PART else 0.7)
+                start = self._entry_point(mesh, -out) + out * gap
+                plotter.add_mesh(pv.Arrow(start=start, direction=out, tip_length=0.3, tip_radius=0.09,
+                                          shaft_radius=0.035, scale=length), color=COLOR_REMOVED)
+                rem_pts.append(start + out * length)
+                rem_txt.append(n.short_label)
+
         if labels and label_pts:
             plotter.add_point_labels(np.array(label_pts), label_txt, font_size=int(13 * scale), point_size=1,
                                      shape_opacity=0.9, shape_color="white", text_color="#1F2023",
+                                     margin=4, always_visible=True, show_points=False)
+        if labels and rem_pts:
+            plotter.add_point_labels(np.array(rem_pts), rem_txt, font_size=int(13 * scale), point_size=1,
+                                     shape_opacity=0.9, shape_color=COLOR_REMOVED, text_color="white",
                                      margin=4, always_visible=True, show_points=False)
 
         if set_camera:

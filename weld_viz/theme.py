@@ -15,13 +15,15 @@ BORDER = "#DCDFE3"
 GRID = "#ECEEF1"
 TEXT = "#1F2023"
 MUTED = "#6B7078"
-AMBER = "#E9A800"        # прижимы и подвижные элементы
+GREEN = "#2E9D5B"        # прижимы и подвижные элементы
 
 # ячейки таблицы этапов
 CELL_PART_ON = "#F6C3C5"
 CELL_PART_ON_OTHER = "#FBE6E7"
-CELL_MOV_ON = "#FBE0A0"
-CELL_MOV_ON_OTHER = "#FDF3D8"
+CELL_MOV_ON = "#BFE5CC"
+CELL_MOV_ON_OTHER = "#E4F4E9"
+CELL_PART_SHOWN = "#D6DEE8"        # ранее заложенная деталь видна на этапе
+CELL_PART_SHOWN_OTHER = "#E9EEF3"
 CELL_CURRENT = "#FFFFFF"
 CELL_OTHER = "#F4F5F7"
 CELL_LOCKED = "#E2E4E8"
