@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 
 os.environ.setdefault("QT_API", "pyside6")
 
-from PySide6.QtCore import QEvent, QObject, QProcess, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QProcess, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 from pyvistaqt import QtInteractor
 
-from . import nx_bridge, theme
+from . import __version__, nx_bridge, theme, updater
 from .model import FIXTURE, HIDDEN, MOVABLE, PART, ROLE_TITLES, AssemblyModel, Classifier, Node
 from .pdf_report import export_pdf
 from .scenario import DIRECTIONS, Scenario, Step
@@ -58,6 +59,12 @@ class NoWheelUnlessFocused(QObject):
         return False
 
 
+class UpdateSignals(QObject):
+    """Результат фоновой проверки обновлений → в поток интерфейса."""
+    result = Signal(object, bool)   # (вид, значение), ручная проверка
+    error = Signal(str, bool)
+
+
 def scenario_path_for(prt: str) -> str:
     return os.path.splitext(prt)[0] + ".weldviz.yaml"
 
@@ -85,8 +92,14 @@ class MainWindow(QMainWindow):
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._do_render)
 
+        self._pending_update = None
+        self._upd = UpdateSignals(self)
+        self._upd.result.connect(self._on_update_result)
+        self._upd.error.connect(self._on_update_error)
+
         self._build_ui()
         self._update_title()
+        QTimer.singleShot(2500, lambda: self.check_updates(manual=False))
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -115,6 +128,8 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         act("Обновить из NX", lambda: self.run_nx_export(force=True),
             tip="Заново выгрузить сборку из NX (если меняли подсборки или детали)")
+        act("Обновления", lambda: self.check_updates(manual=True),
+            tip=f"Версия {__version__}. Проверить, есть ли новая версия программы")
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
@@ -239,6 +254,13 @@ class MainWindow(QMainWindow):
         wl.setContentsMargins(10, 10, 10, 6)
         wl.addWidget(main)
         self.setCentralWidget(wrap)
+        self.update_btn = QPushButton()
+        self.update_btn.setObjectName("primary")
+        self.update_btn.setCursor(Qt.PointingHandCursor)
+        self.update_btn.clicked.connect(self.install_update)
+        self.update_btn.hide()
+        self.statusBar().addPermanentWidget(self.update_btn)
+        self.statusBar().addPermanentWidget(label(f"версия {__version__}", "hint"))
         self.statusBar().showMessage("Откройте сборку NX (.prt) или сценарий (.yaml)")
 
     def _show_all_toggled(self, on):
@@ -248,7 +270,7 @@ class MainWindow(QMainWindow):
 
     def _update_title(self):
         name = os.path.basename(self.scenario_path or self.prt_path or "") or "без имени"
-        self.setWindowTitle(f"{APP_TITLE} — {name}{' *' if self.dirty else ''}")
+        self.setWindowTitle(f"{APP_TITLE} {__version__} — {name}{' *' if self.dirty else ''}")
 
     def mark_dirty(self):
         self.dirty = True
@@ -330,6 +352,91 @@ class MainWindow(QMainWindow):
             return False
         self.scenario_path = path
         return self.save()
+
+    # ------------------------------------------------------------ обновления
+    def check_updates(self, manual=False):
+        def work():
+            try:
+                if updater.is_git_checkout():
+                    self._upd.result.emit(("git", updater.git_check()), manual)
+                else:
+                    self._upd.result.emit(("release", updater.check()), manual)
+            except Exception as e:  # сеть недоступна и т.п.
+                self._upd.error.emit(str(e), manual)
+
+        if manual:
+            self.statusBar().showMessage("Проверка обновлений…", 3000)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_result(self, res, manual):
+        kind, val = res
+        if kind == "git" and val > 0:
+            self._pending_update = res
+            self.update_btn.setText(f"Есть обновление ({val} изм.) — обновить")
+            self.update_btn.show()
+        elif kind == "release" and val is not None:
+            self._pending_update = res
+            self.update_btn.setText(f"Доступна версия {val.version} — обновить")
+            self.update_btn.show()
+        elif manual:
+            text = f"Установлена последняя версия {__version__}."
+            if kind == "git" and val < 0:
+                text = "У папки программы нет связанного удалённого репозитория (git remote) — обновлять неоткуда."
+            QMessageBox.information(self, APP_TITLE, text + f"\n\nИсточник обновлений: {updater.source_title()}")
+            return
+        if manual and self._pending_update:
+            self.install_update()
+
+    def _on_update_error(self, msg, manual):
+        if manual:
+            QMessageBox.warning(self, APP_TITLE, f"Не удалось проверить обновления:\n{msg}\n\n"
+                                                 f"Источник: {updater.source_title()}")
+
+    def install_update(self):
+        if not self._pending_update:
+            return
+        kind, val = self._pending_update
+        if kind == "git":
+            if QMessageBox.question(self, APP_TITLE, f"На сервере {val} новых изменений. Загрузить (git pull)?") \
+                    != QMessageBox.Yes:
+                return
+            try:
+                out = updater.git_pull()
+            except Exception as e:
+                QMessageBox.critical(self, APP_TITLE, f"git pull не удался:\n{e}")
+                return
+            self.update_btn.hide()
+            self._pending_update = None
+            QMessageBox.information(self, APP_TITLE, f"Обновлено:\n{out}\n\nПерезапустите программу.")
+            return
+
+        notes = f"\n\nЧто нового:\n{val.notes}" if val.notes else ""
+        if QMessageBox.question(self, APP_TITLE, f"Установить версию {val.version} (сейчас {__version__})?\n"
+                                                 f"Программа закроется и запустится заново.{notes}") \
+                != QMessageBox.Yes:
+            return
+        if not self._confirm_discard():
+            return
+        dlg = QProgressDialog("Загрузка обновления…", None, 0, 100, self)
+        dlg.setWindowTitle(APP_TITLE)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.show()
+
+        def progress(done, total):
+            dlg.setValue(int(done * 100 / total) if total else 0)
+            QApplication.processEvents()
+
+        try:
+            zip_path = updater.download(val, progress)
+            updater.start_install(zip_path)
+        except Exception as e:
+            dlg.close()
+            QMessageBox.critical(self, APP_TITLE, f"Не удалось установить обновление:\n{e}")
+            return
+        dlg.close()
+        self.dirty = False
+        self.close()
+        QApplication.quit()
 
     def closeEvent(self, e):
         if self._confirm_discard():

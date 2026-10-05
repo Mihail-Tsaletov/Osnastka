@@ -31,6 +31,30 @@
 
 Подробно для технолога — [ИНСТРУКЦИЯ.md](ИНСТРУКЦИЯ.md).
 
+## Версии и обновления
+
+Номер версии — `weld_viz/__init__.py`. Выпуск новой версии одной командой (рабочее дерево должно быть
+закоммичено):
+
+```
+release.bat 0.2.0 "Что нового — увидят пользователи"
+```
+
+`tools/release.py`: проставляет версию → собирает exe → `dist/Osnastka-0.2.0.zip` → коммит «Версия 0.2.0»
+и тег `v0.2.0` → `git push --follow-tags` → `gh release create` с архивом. Нужны `git remote` и
+`gh auth login` (один раз).
+
+Как программа обновляется (`weld_viz/updater.py`):
+- **exe** — при запуске спрашивает GitHub API последний релиз `Mihail-Tsaletov/Osnastka`
+  (репозиторий открытый, токен не нужен). Если версия новее — кнопка «Доступна версия X — обновить».
+  Скачивается `Osnastka-X.zip`, распаковывается во `%TEMP%\osnastka_update`, новая версия запускается
+  с ключом `--apply-update <папка> <pid>`: ждёт закрытия старой, заменяет `_internal` и `Osnastka.exe`,
+  перезапускает программу. Файлы рядом с exe (например `update.json`) не трогаются.
+- **из исходников** (`run.bat`, есть `.git`) — `git fetch` + сравнение с `origin/main`; обновление — `git pull --ff-only`.
+- **без доступа к GitHub** — `update.json` рядом с exe: `{"folder": "\\\\server\\share\\Osnastka"}`,
+  выпуск: `release.bat 0.2.0 "…" --folder \\server\share\Osnastka` (кладёт zip и `latest.json`).
+  Для закрытого репозитория: `{"github": "owner/repo", "token": "<токен только на чтение>"}`.
+
 ## Тестовые модели
 
 - `test_model/` — простая сборка из блоков и готовый сценарий (`nx\build_test_assembly.py`).
