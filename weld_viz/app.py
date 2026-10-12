@@ -9,15 +9,16 @@ import time
 os.environ.setdefault("QT_API", "pyside6")
 
 from PySide6.QtCore import QEvent, QObject, QProcess, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
-                               QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
+                               QInputDialog,                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
                                QProgressDialog, QPushButton, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
                                QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 from pyvistaqt import QtInteractor
 
-from . import __version__, nx_bridge, theme, updater
-from .model import FIXTURE, HIDDEN, MOVABLE, PART, ROLE_TITLES, AssemblyModel, Classifier, Node
+from . import __version__, nx_bridge, replace, theme, updater
+from .model import (FIXTURE, GROUP_PREFIX, HIDDEN, MOVABLE, PART, ROLE_TITLES, AssemblyModel, Classifier, Node,
+                    prefix_of)
 from .pdf_report import export_pdf
 from .scenario import DIRECTIONS, Scenario, Step
 from .scene import COLOR_FIXTURE, COLOR_MOVABLE, COLOR_PART_NEW, SceneBuilder
@@ -91,6 +92,10 @@ class MainWindow(QMainWindow):
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._do_render)
+        self._sel_timer = QTimer(self)
+        self._sel_timer.setSingleShot(True)
+        self._sel_timer.timeout.connect(self._apply_selection)
+        self._fresh_export = False
 
         self._pending_update = None
         self._upd = UpdateSignals(self)
@@ -139,11 +144,22 @@ class MainWindow(QMainWindow):
         # ---- слева: состав сборки
         left, lv = card()
         lv.addWidget(label("Состав сборки", "cardTitle"))
-        lv.addWidget(label("Правый клик — роль компонента или основная деталь оснастки", "hint"))
+        tree_hint = label("Выделите один или несколько элементов (Ctrl, Shift) и щёлкните правой кнопкой: роль, "
+                          "группа, основная деталь оснастки. Выбранное подсвечивается синим, двойной щелчок — "
+                          "приблизить.", "hint")
+        tree_hint.setWordWrap(True)
+        lv.addWidget(tree_hint)
         self.fixture_label = label("", "chip")
         self.fixture_label.setWordWrap(True)
         lv.addWidget(self.fixture_label)
+        self.missing_label = label("", "chipMuted")
+        self.missing_label.setWordWrap(True)
+        self.missing_label.hide()
+        lv.addWidget(self.missing_label)
         self.tree = QTreeWidget()
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.itemSelectionChanged.connect(lambda: self._sel_timer.start(80))
+        self.tree.itemDoubleClicked.connect(lambda *_: self.focus_selection())
         self.tree.setHeaderLabels(["Компонент", "Роль"])
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.tree.header().setStretchLastSection(False)
@@ -230,10 +246,13 @@ class MainWindow(QMainWindow):
         self.table.setFocusPolicy(Qt.NoFocus)
         self.table.setFrameShape(QFrame.NoFrame)
         self.table.cellClicked.connect(self._cell_clicked)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._cell_menu)
         self.table.horizontalHeader().sectionClicked.connect(self._header_clicked)
         self.table.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.horizontalHeader().customContextMenuRequested.connect(self._header_menu)
         self.table.verticalHeader().setDefaultSectionSize(26)
+        self.table.verticalHeader().sectionClicked.connect(self._row_header_clicked)
         sv.addWidget(self.table, 1)
         sv.addWidget(label("Редактируется только текущий этап (▶ в заголовке). Щелчок по другому столбцу — переход "
                            "к этапу. Правый клик по заголовку этапа — вставить, переставить, удалить.", "hint"))
@@ -446,18 +465,21 @@ class MainWindow(QMainWindow):
             e.ignore()
 
     # ------------------------------------------------------------ экспорт NX
-    def run_nx_export(self, force=False):
-        if not self.prt_path:
+    def run_nx_export(self, force=False, path=None, on_done=None):
+        """Выгрузка файла из NX в фоне. path — другой файл (замена узла), on_done — что сделать после."""
+        target = path or self.prt_path
+        if not target:
             return
         if force and self.model:
             self._pending_scenario = self.scenario
         try:
-            cmd = nx_bridge.export_command(self.prt_path)
+            cmd = nx_bridge.export_command(target)
         except RuntimeError as e:
             QMessageBox.critical(self, APP_TITLE, str(e))
             return
-        self._progress = QProgressDialog("Выгрузка сборки из NX…\nЭто может занять до нескольких минут.",
-                                         None, 0, 0, self)
+        self._export_on_done = on_done
+        self._progress = QProgressDialog(f"Выгрузка из NX: {os.path.basename(target)}…\n"
+                                         f"Это может занять до нескольких минут.", None, 0, 0, self)
         self._progress.setWindowTitle(APP_TITLE)
         self._progress.setWindowModality(Qt.WindowModal)
         self._progress.show()
@@ -472,9 +494,20 @@ class MainWindow(QMainWindow):
         if "EXPORT_OK" not in out:
             QMessageBox.critical(self, APP_TITLE, "Экспорт из NX не удался:\n\n" + out[-2500:])
             return
+        on_done, self._export_on_done = getattr(self, "_export_on_done", None), None
+        if on_done:
+            on_done()
+            return
+        self._fresh_export = True
         self._on_export_ready()
 
     def _on_export_ready(self):
+        sc = self._pending_scenario or self.scenario
+        stale = [r["file"] for r in sc.replacements.values()
+                 if os.path.exists(r.get("file", "")) and not nx_bridge.is_export_fresh(r["file"])]
+        if stale:  # сначала выгрузить файлы замен узлов, потом продолжить открытие
+            self.run_nx_export(path=stale[0], on_done=self._on_export_ready)
+            return
         try:
             self.model = AssemblyModel(nx_bridge.export_dir_for(self.prt_path))
         except Exception as e:
@@ -489,17 +522,34 @@ class MainWindow(QMainWindow):
         if not sc.steps:
             sc.steps.append(Step(name="Установить базовую деталь"))
         self.scenario = sc
+        repl_warnings = replace.apply_all(self.model, sc)
+        skipped = self.model.apply_groups(sc.groups)
         self.dirty = self.dirty or self.scenario_path is None
         self.current_step = None
         self._reclassify()
         self.select_step(0)
         self._update_title()
+        fresh, self._fresh_export = self._fresh_export, False
+        if fresh and self.model.missing:
+            QMessageBox.information(self, APP_TITLE, self._missing_text(20))
         if self.model.warnings:
             QMessageBox.warning(self, APP_TITLE, "Предупреждения экспорта:\n" + "\n".join(self.model.warnings[:20]))
+        if skipped:
+            QMessageBox.warning(self, APP_TITLE, "Группы без тел в текущей модели (пропущены): " + ", ".join(skipped))
+        if repl_warnings:
+            QMessageBox.warning(self, APP_TITLE, "Замены узлов:\n" + "\n".join(repl_warnings))
+
+    def _missing_text(self, limit) -> str:
+        m = self.model.missing
+        lines = [f"  {x['count']} × {x['name']}" for x in m[:limit]]
+        more = f"\n  … и ещё {len(m) - limit} видов" if len(m) > limit else ""
+        return (f"Сборка открыта без {self.model.missing_count} компонентов ({len(m)} видов): их файлов нет "
+                f"в папке сборки — обычно это стандартные и покупные изделия с сервера.\n\n" +
+                "\n".join(lines) + more)
 
     # ------------------------------------------------------------- роли
     def _reclassify(self):
-        self.cls = Classifier(self.model, self.scenario.fixture_main, self.scenario.roles)
+        self.cls = Classifier(self.model, self.scenario.fixture_main, self.scenario.roles, self.scenario.split)
         self._fill_tree()
         self._fill_table()
 
@@ -508,13 +558,40 @@ class MainWindow(QMainWindow):
         self.tree.clear()
         main = self.scenario.fixture_main
 
+        icons = {}
+
+        def role_icon(role):
+            """Квадратик цвета роли: деталь — красный, оснастка — серый, прижим — зелёный."""
+            if role not in icons:
+                pm = QPixmap(12, 12)
+                pm.fill(QColor(ROLE_COLORS[role]))
+                icons[role] = QIcon(pm)
+            return icons[role]
+
         def add(node: Node, parent_item):
             item = QTreeWidgetItem([node.label, ""])
             item.setData(0, KEY_ROLE, node.key)
+            tips = []
+            if node.is_group:
+                f = QFont()
+                f.setItalic(True)
+                item.setFont(0, f)
+                tips.append("Группа — правый клик: переименовать, разгруппировать")
+            rgb = self.model.rgb(node)
+            if rgb:  # цвет тела в NX — только в подсказке, чтобы не путать с цветом роли
+                hexc = QColor.fromRgbF(*rgb).name()
+                tips.append(f"Цвет тела в NX: <span style='color:{hexc}'>■■■</span> (№{node.color})")
             role = self.cls.role(node)
             if role:
-                item.setText(1, ROLE_TITLES[role] + (" *" if node.key in self.scenario.roles else ""))
+                item.setIcon(0, role_icon(role))
+                item.setText(1, ROLE_TITLES[role] + (" *" if node.key in self.scenario.roles else "") +
+                             (" — заменён" if node.replaced_by else "") +
+                             (" — разобран" if node.key in self.cls.split and not node.replaced_by else ""))
                 item.setForeground(1, QBrush(QColor(ROLE_COLORS[role]).darker(130)))
+            if node.replaced_by:
+                tips.append(f"Заменён деталью из файла:<br>{node.replaced_by}")
+            if tips:
+                item.setToolTip(0, "<br>".join(tips))
             if node.key == main:
                 f = QFont()
                 f.setBold(True)
@@ -535,30 +612,99 @@ class MainWindow(QMainWindow):
             ch.setExpanded(ch.data(0, KEY_ROLE) == main)
         self.tree.resizeColumnToContents(1)
         main_node = self.model.by_key.get(main) if main else None
-        self.fixture_label.setText(
-            f"Оснастка: <b>{main_node.designation}</b>, префикс <b>{self.cls.prefix}</b>" if main_node
-            else "<span style='color:#b00'>Основная деталь оснастки не выбрана</span>")
+        if self.model.kind == "bodies":
+            n_bodies = sum(1 for n in self.model.root.walk() if n.mesh)
+            self.fixture_label.setText(
+                f"Деталь из тел («шоп»): <b>{n_bodies}</b> тел. По умолчанию всё — оснастка. Выделите тела "
+                f"детали или прижима → правый клик → «Объединить в группу» и задайте группе роль.")
+        else:
+            self.fixture_label.setText(
+                f"Оснастка: <b>{main_node.designation}</b>, префикс <b>{self.cls.prefix}</b>" if main_node
+                else "<span style='color:#b00'>Основная деталь оснастки не выбрана</span>")
+        if self.model.missing:
+            self.missing_label.setText(f"Без {self.model.missing_count} незагруженных компонентов "
+                                       f"(стандартные и покупные изделия) — подробнее в подсказке")
+            self.missing_label.setToolTip(self._missing_text(40))
+            self.missing_label.show()
+        else:
+            self.missing_label.hide()
         self._updating = False
+
+    def _selected_keys(self) -> list[str]:
+        return [it.data(0, KEY_ROLE) for it in self.tree.selectedItems()]
 
     def _tree_menu(self, pos):
         item = self.tree.itemAt(pos)
         if not item or not self.model:
             return
-        key = item.data(0, KEY_ROLE)
-        node = self.model.by_key[key]
+        if not item.isSelected():
+            self.tree.clearSelection()
+            item.setSelected(True)
+        keys = [k for k in self._selected_keys() if k in self.model.by_key]
+        nodes = [self.model.by_key[k] for k in keys]
+        movable_nodes = [n for n in nodes if n.parent is not None]
         menu = QMenu(self)
-        a = menu.addAction("Основная деталь оснастки (префикс %s)" % node.designation.split(".", 1)[0])
-        a.triggered.connect(lambda: self._set_fixture_main(key))
-        if node.parent is not None:
+
+        if len(nodes) == 1 and self.model.kind != "bodies" and not nodes[0].is_group:
+            node = nodes[0]
+            a = menu.addAction("Основная деталь оснастки (префикс %s)" % prefix_of(node.designation))
+            a.triggered.connect(lambda: self._set_fixture_main(node.key))
             menu.addSeparator()
+
+        if len(nodes) == 1 and nodes[0].parent is not None and not nodes[0].is_group and nodes[0].children:
+            node = nodes[0]
+            if node.key in self.scenario.split:
+                menu.addAction("Собрать обратно в одну строку").triggered.connect(lambda: self._join(node))
+            else:
+                n_parts = sum(1 for c in node.children if any(x.mesh for x in c.walk()))
+                menu.addAction(f"Разобрать на составляющие ({n_parts} шт.) — закладывать по очереди"
+                               ).triggered.connect(lambda: self._split(node))
+            menu.addSeparator()
+
+        if len(nodes) == 1 and nodes[0].color is not None and nodes[0].parent is not None:
+            body = nodes[0]
+            same = [c for c in body.parent.children if c.color == body.color]
+            if len(same) > 1:
+                menu.addAction(f"Выделить тела того же цвета ({len(same)} шт.)").triggered.connect(
+                    lambda: self.select_in_tree([c.key for c in same]))
+                menu.addSeparator()
+
+        if (len(nodes) == 1 and nodes[0].parent is not None and not nodes[0].is_group and not nodes[0].is_body
+                and self.model.kind == "assembly"):
+            node = nodes[0]
+            if node.key in self.scenario.replacements:
+                menu.addAction("Вернуть исходную деталь (убрать замену)").triggered.connect(
+                    lambda: self._replace_revert(node.key))
+            elif self.model.original_leaves(node.key) or node.mesh:
+                menu.addAction("Заменить деталью из файла… (узел с деревом деталей)").triggered.connect(
+                    lambda: self._replace_start(node))
+            menu.addSeparator()
+
+        groupable = [n for n in movable_nodes if not n.is_group]
+        if groupable and len({id(n.parent) for n in groupable}) == 1:
+            a = menu.addAction(f"Объединить в группу… ({len(groupable)} шт.)")
+            a.triggered.connect(lambda: self._group(groupable))
+        groups = [n for n in nodes if n.is_group]
+        if len(groups) == 1:
+            menu.addAction("Переименовать группу…").triggered.connect(lambda: self._rename_group(groups[0]))
+        if groups:
+            menu.addAction("Разгруппировать").triggered.connect(lambda: self._ungroup(groups))
+        if not menu.isEmpty():
+            menu.addSeparator()
+
+        if movable_nodes:
+            mkeys = [n.key for n in movable_nodes]
+            suffix = f" ({len(mkeys)} шт.)" if len(mkeys) > 1 else ""
             for role, title in ROLE_TITLES.items():
-                a = menu.addAction("Роль: " + title)
+                a = menu.addAction("Роль: " + title + suffix)
                 a.setCheckable(True)
-                a.setChecked(self.scenario.roles.get(key) == role)
-                a.triggered.connect(lambda _=False, r=role: self._set_role(key, r))
-            a = menu.addAction("Роль: по умолчанию (по префиксу)")
-            a.setEnabled(key in self.scenario.roles)
-            a.triggered.connect(lambda: self._set_role(key, None))
+                a.setChecked(all(self.scenario.roles.get(k) == role for k in mkeys))
+                a.triggered.connect(lambda _=False, r=role: self._set_role(mkeys, r))
+            a = menu.addAction("Роль: по умолчанию" + suffix)
+            a.setEnabled(any(k in self.scenario.roles for k in mkeys))
+            a.triggered.connect(lambda: self._set_role(mkeys, None))
+            menu.addSeparator()
+        menu.addAction("Приблизить в 3D").triggered.connect(self.focus_selection)
         menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     def _set_fixture_main(self, key):
@@ -567,14 +713,255 @@ class MainWindow(QMainWindow):
         self._reclassify()
         self.refresh_view()
 
-    def _set_role(self, key, role):
-        if role is None:
-            self.scenario.roles.pop(key, None)
-        else:
-            self.scenario.roles[key] = role
+    def _set_role(self, keys, role):
+        for key in ([keys] if isinstance(keys, str) else keys):
+            if role is None:
+                self.scenario.roles.pop(key, None)
+            else:
+                self.scenario.roles[key] = role
         self.mark_dirty()
         self._reclassify()
         self.refresh_view()
+
+    # ------------------------------------------------------------- группы тел
+    def _ask_group_name(self, title, default) -> str | None:
+        while True:
+            name, ok = QInputDialog.getText(self, APP_TITLE, title, text=default)
+            if not ok:
+                return None
+            name = name.strip()
+            if not name or "/" in name:
+                QMessageBox.warning(self, APP_TITLE, "Имя группы не должно быть пустым и содержать «/».")
+            elif name in self.scenario.groups and name != default:
+                QMessageBox.warning(self, APP_TITLE, f"Группа «{name}» уже есть.")
+            else:
+                return name
+
+    def _group(self, nodes: list[Node]):
+        n = len(self.scenario.groups) + 1
+        while f"Группа {n}" in self.scenario.groups:
+            n += 1
+        name = self._ask_group_name(f"Имя группы ({len(nodes)} шт.). Слово «прижим» или «палец» в имени — "
+                                    f"группа сразу станет прижимом:", f"Группа {n}")
+        if not name:
+            return
+        keys = [x.key for x in nodes]
+        gkey = nodes[0].parent.key + "/" + GROUP_PREFIX + name
+        roles = [self.scenario.roles.pop(k) for k in keys if k in self.scenario.roles]
+        if roles:  # роль, назначенная членам вручную, переходит к группе
+            self.scenario.roles[gkey] = max(set(roles), key=roles.count)
+        self._merge_refs(keys, gkey)
+        self.scenario.groups[name] = keys
+        self._regroup()
+
+    def _rename_group(self, group: Node):
+        old = group.name
+        new = self._ask_group_name("Новое имя группы:", old)
+        if not new or new == old:
+            return
+        old_key = group.key
+        new_key = group.parent.key + "/" + GROUP_PREFIX + new
+        self.scenario.groups = {(new if k == old else k): v for k, v in self.scenario.groups.items()}
+        self._replace_key(old_key, new_key)
+        self._regroup()
+
+    def _ungroup(self, groups: list[Node]):
+        for g in groups:
+            members = self.scenario.groups.pop(g.name, [])
+            role = self.scenario.roles.get(g.key)
+            if role:  # роль группы остаётся у её членов
+                for k in members:
+                    self.scenario.roles[k] = role
+            self._expand_refs(g.key, members)
+            self._replace_key(g.key, None)
+        self._regroup()
+
+    def _merge_refs(self, keys, new_key):
+        """Отметки этапов у keys заменить одной отметкой new_key (для «добавить» — на самом раннем этапе)."""
+        keys = set(keys)
+        first_add = next((i for i, st in enumerate(self.scenario.steps) if keys & set(st.add)), None)
+        for i, st in enumerate(self.scenario.steps):
+            for lst, keep in ((st.add, i == first_add), (st.show, None), (st.hide, None)):
+                hit = keys & set(lst)
+                if not hit:
+                    continue
+                lst[:] = [k for k in lst if k not in keys]
+                if (keep if keep is not None else True) and new_key not in lst:
+                    lst.append(new_key)
+
+    def _expand_refs(self, key, new_keys):
+        """Отметку key заменить отметками new_keys."""
+        for st in self.scenario.steps:
+            for lst in (st.add, st.show, st.hide):
+                if key in lst:
+                    lst.remove(key)
+                    lst.extend(k for k in new_keys if k not in lst)
+
+    # ------------------------------------------------------------- разбор узла на составляющие
+    def _split(self, node: Node):
+        parts = [c.key for c in node.children if any(x.mesh for x in c.walk())]
+        placed = self.scenario.step_of_part(node.key)
+        # закладку узла не размножаем на все детали — их распределяют по этапам заново
+        for st in self.scenario.steps:
+            if node.key in st.add:
+                st.add.remove(node.key)
+        self.scenario.split.append(node.key)
+        self._expand_refs(node.key, parts)   # видимость (прижимы / скрытие) переносится на составляющие
+        self.mark_dirty()
+        self._reclassify()
+        self.refresh_view()
+        msg = f"«{node.short_label}» разобран: {len(parts)} составляющих — отдельные строки таблицы этапов."
+        if placed is not None:
+            msg += (f"\n\nУзел был отмечен на этапе {placed + 1}. Теперь распределите его детали по этапам: "
+                    f"на нужном этапе щёлкните по клетке детали.")
+        msg += ("\n\nЛишнее (например, сварные швы) удобно скрыть: правый клик по такому телу → «Выделить тела "
+                "того же цвета» → правый клик → «Роль: Скрыть».")
+        QMessageBox.information(self, APP_TITLE, msg)
+
+    def _join(self, node: Node):
+        self.scenario.split = [k for k in self.scenario.split if k != node.key]
+        inner = [n.key for n in node.walk() if n is not node]
+        self.scenario.split = [k for k in self.scenario.split if k not in inner]
+        self._merge_refs(inner, node.key)
+        self.mark_dirty()
+        self._reclassify()
+        self.refresh_view()
+
+    def _replace_key(self, old, new):
+        """Переименовать (new) или удалить (None) ключ во всех ссылках сценария."""
+        sc = self.scenario
+        if old in sc.roles:
+            role = sc.roles.pop(old)
+            if new:
+                sc.roles[new] = role
+        if sc.fixture_main == old:
+            sc.fixture_main = new
+        for st in sc.steps:
+            for lst in (st.add, st.show, st.hide):
+                if old in lst:
+                    i = lst.index(old)
+                    if new:
+                        lst[i] = new
+                    else:
+                        del lst[i]
+
+    # ------------------------------------------------------------- замена узла деталью из файла
+    def _replace_start(self, node: Node):
+        start_dir = os.path.dirname(self.prt_path or "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Чем заменить «{node.short_label}» — деталь или сборка NX", start_dir, "Файлы NX (*.prt)")
+        if not path:
+            return
+        path = os.path.abspath(path)
+        if nx_bridge.is_export_fresh(path):
+            self._replace_finish(node.key, path)
+        else:
+            self.run_nx_export(path=path, on_done=lambda: self._replace_finish(node.key, path))
+
+    def _replace_finish(self, key: str, path: str):
+        node = self.model.by_key[key]
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            repl = replace.load_replacement(path)
+            res = replace.align(self.model, key, repl)
+        finally:
+            QApplication.restoreOverrideCursor()
+        name = os.path.basename(path)
+        if res.matched == 0:
+            QMessageBox.critical(self, APP_TITLE,
+                                 f"Не удалось совместить «{name}» с «{node.short_label}»: ни одна деталь файла не "
+                                 f"совпала по форме с телами узла. Проверьте, что выбран файл того же узла.")
+            return
+        if not res.ok and QMessageBox.question(
+                self, APP_TITLE, f"Совместить удалось частично: {res.summary}.\n\nНе совпавшие детали могут встать "
+                                 f"неточно. Всё равно заменить?") != QMessageBox.Yes:
+            return
+        self._drop_refs([n.key for n in node.walk() if n is not node])
+        for st in self.scenario.steps:   # закладку узла — заново по деталям
+            if key in st.add:
+                st.add.remove(key)
+        self.scenario.replacements[key] = {"file": path, "matrix": [round(float(v), 6) for v in res.matrix.flatten()],
+                                           "summary": res.summary}
+        if key not in self.scenario.split:
+            self.scenario.split.append(key)
+        self.model.set_replacement(key, repl, res.matrix)
+        self.model.apply_groups(self.scenario.groups)
+        self.mark_dirty()
+        self._reclassify()
+        self.refresh_view()
+        QMessageBox.information(self, APP_TITLE,
+                                f"«{node.short_label}» заменён деталью «{name}»: {res.summary}.\n\n"
+                                f"Детали узла теперь отдельные строки таблицы этапов — распределите их по этапам. "
+                                f"Исходные файлы NX не изменены; вернуть — правый клик по узлу.")
+
+    def _replace_revert(self, key: str):
+        node = self.model.by_key[key]
+        self._drop_refs([n.key for n in node.walk() if n is not node])
+        self.scenario.replacements.pop(key, None)
+        self.model.clear_replacement(key)
+        self.model.apply_groups(self.scenario.groups)
+        self.mark_dirty()
+        self._reclassify()
+        self.refresh_view()
+
+    def _drop_refs(self, keys):
+        """Убрать из сценария все ссылки на узлы keys (роли, этапы, группы)."""
+        keys = set(keys)
+        sc = self.scenario
+        for k in keys:
+            sc.roles.pop(k, None)
+        sc.split = [k for k in sc.split if k not in keys]
+        for st in sc.steps:
+            for lst in (st.add, st.show, st.hide):
+                lst[:] = [k for k in lst if k not in keys]
+        for name in list(sc.groups):
+            sc.groups[name] = [k for k in sc.groups[name] if k not in keys]
+            if not sc.groups[name]:
+                del sc.groups[name]
+
+    def _regroup(self):
+        self.model.apply_groups(self.scenario.groups)
+        self.mark_dirty()
+        self._reclassify()
+        self.refresh_view()
+
+    # ------------------------------------------------------------- выбор в дереве → 3D
+    def _apply_selection(self):
+        if not self.scene or not self.model:
+            return
+        nodes = [self.model.by_key[k] for k in self._selected_keys() if k in self.model.by_key]
+        nodes = [n for n in nodes if n.parent is not None]   # корень = вся модель — не подсвечиваем
+        self.scene.highlight(self.plotter, nodes)
+        if nodes:
+            self.statusBar().showMessage(f"Выбрано: {len(nodes)}", 3000)
+
+    def _row_header_clicked(self, row):
+        """Щелчок по названию строки таблицы — выбрать этот элемент в дереве и подсветить в 3D."""
+        if 0 <= row < len(self._rows) and self._rows[row][0] != "header":
+            self.select_in_tree([self._rows[row][1].key])
+
+    def select_in_tree(self, keys):
+        keys = set(keys)
+        self.tree.clearSelection()
+        first = None
+        stack = [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
+        while stack:
+            it = stack.pop()
+            if it.data(0, KEY_ROLE) in keys:
+                it.setSelected(True)
+                first = first or it
+            stack.extend(it.child(i) for i in range(it.childCount()))
+        if first is not None:
+            self.tree.scrollToItem(first)
+
+    def focus_selection(self):
+        nodes = [self.model.by_key[k] for k in self._selected_keys() if self.model and k in self.model.by_key]
+        mesh = self.scene.highlight(self.plotter, nodes) if nodes and self.scene else None
+        if mesh is None:
+            return
+        self.plotter.reset_camera(bounds=mesh.bounds)
+        self.plotter.camera.zoom(0.6)
+        self.plotter.render()
 
     def _cleanup_scenario(self):
         """Убирает из этапов ключи, которые больше не являются строками таблицы."""
@@ -618,9 +1005,16 @@ class MainWindow(QMainWindow):
                     it.setData(KEY_KIND, kind)
                 t.setItem(r, c, it)
         t.setVerticalHeaderLabels(labels)
-        for r, (kind, _) in enumerate(self._rows):
+        for r, (kind, obj) in enumerate(self._rows):
             if kind == "header":
                 t.verticalHeaderItem(r).setFont(bold)
+            else:
+                rgb = self.model.rgb(obj)
+                if rgb:  # цвет тела из NX — чтобы различать Body12, Body13…
+                    pm = QPixmap(10, 10)
+                    pm.fill(QColor.fromRgbF(*rgb))
+                    t.verticalHeaderItem(r).setIcon(QIcon(pm))
+                t.verticalHeaderItem(r).setToolTip("Щёлкните, чтобы подсветить в 3D")
         t.horizontalHeader().setDefaultSectionSize(140)
         self._updating = False
         self._sync_table()
@@ -739,6 +1133,40 @@ class MainWindow(QMainWindow):
         if col != self.current_step:
             self.select_step(col)
             self._switched_at = time.monotonic()
+
+    def _cell_menu(self, pos):
+        """Правый клик по клетке детали в текущем этапе: перенести закладку на этот этап."""
+        item = self.table.itemAt(pos)
+        if item is None or item.data(KEY_KIND) != PART:
+            return
+        col, key = item.column(), item.data(KEY_ROLE)
+        if col != self.current_step:
+            self.select_step(col)
+            return
+        placed = self.scenario.step_of_part(key)
+        menu = QMenu(self)
+        if placed == col:
+            menu.addAction("Не закладывать на этом этапе").triggered.connect(lambda: self._place_part(key, None))
+        else:
+            text = f"Закладывать на этапе {col + 1}"
+            if placed is not None:
+                text += f" (перенести с этапа {placed + 1})"
+            menu.addAction(text).triggered.connect(lambda: self._place_part(key, col))
+        menu.addAction("Подсветить в 3D").triggered.connect(lambda: self.select_in_tree([key]))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _place_part(self, key, col):
+        """Закладка детали на этапе col (None — снять закладку)."""
+        for i, st in enumerate(self.scenario.steps):
+            if key in st.add:
+                st.add.remove(key)
+            if col is not None and i <= col and key in st.hide:
+                st.hide.remove(key)   # до закладки и на ней деталь не может быть «убрана»
+        if col is not None:
+            self.scenario.steps[col].add.append(key)
+        self.mark_dirty()
+        self._sync_table()
+        self.refresh_view()
 
     def _cell_clicked(self, row, col):
         item = self.table.item(row, col)
@@ -918,6 +1346,8 @@ class MainWindow(QMainWindow):
         kw = {"font_file": ARIAL} if os.path.exists(ARIAL) else {}
         self.plotter.add_text(title, position="upper_left", font_size=10, color=theme.GRAPHITE, **kw)
         self.plotter.render()
+        if self.tree.selectedItems():
+            self._apply_selection()
         if reset and step is not None:
             self._entry_camera = SceneBuilder.capture_camera(self.plotter)
             self._update_camera_mark()

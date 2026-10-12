@@ -1,6 +1,9 @@
 """Построение 3D-сцены этапа (PyVista): оснастка, детали, прижимы, стрелки."""
 from __future__ import annotations
 
+import os
+from collections import OrderedDict
+
 import numpy as np
 import pyvista as pv
 from vtkmodules.vtkRenderingCore import vtkMapper
@@ -21,6 +24,10 @@ REMOVED_OPACITY = 0.28
 COLOR_BG = "white"
 
 DEFAULT_VIEW = np.array([0.75, -1.0, 0.85])
+COLOR_SELECTION = "#1E88E5"
+LABEL_FONT = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arial.ttf")
+LABEL_KW = {"font_file": LABEL_FONT} if os.path.exists(LABEL_FONT) else {}   # кириллица в подписях
+MERGE_CACHE_SIZE = 48
 
 
 class SceneBuilder:
@@ -28,6 +35,7 @@ class SceneBuilder:
         self.model = model
         self._meshes: dict[str, pv.PolyData] = {}
         self._edges: dict[str, pv.PolyData] = {}
+        self._merged: OrderedDict = OrderedDict()   # набор файлов -> (сетка, рёбра); тысячи тел шоп-файла
 
     # --- геометрия ---
     def _leaf_mesh(self, path: str) -> pv.PolyData:
@@ -46,13 +54,33 @@ class SceneBuilder:
                  if n.mesh and (role is None or cls.role(n) == role)]
         if not files:
             return None, None
+        cache_key = tuple(files)
+        if cache_key in self._merged:
+            self._merged.move_to_end(cache_key)
+            return self._merged[cache_key]
         meshes = [self._leaf_mesh(f) for f in files]
         edges = [self._edges[f] for f in files if self._edges[f].n_points]
         mesh = meshes[0] if len(meshes) == 1 else pv.merge(meshes)
         edge = None
         if edges:
             edge = edges[0] if len(edges) == 1 else pv.merge(edges)
+        self._merged[cache_key] = (mesh, edge)
+        if len(self._merged) > MERGE_CACHE_SIZE:
+            self._merged.popitem(last=False)
         return mesh, edge
+
+    def highlight(self, plotter: pv.Plotter, nodes: list[Node]):
+        """Подсветка выбранных узлов (поверх сцены, без перестроения)."""
+        for name in ("__sel_mesh__", "__sel_box__"):
+            plotter.remove_actor(name, render=False)
+        mesh, _ = self.node_mesh(nodes) if nodes else (None, None)
+        if mesh is not None:
+            plotter.add_mesh(mesh, color=COLOR_SELECTION, name="__sel_mesh__", opacity=0.85,
+                             smooth_shading=False, reset_camera=False)
+            plotter.add_mesh(mesh.outline(), color=COLOR_SELECTION, line_width=2, name="__sel_box__",
+                             reset_camera=False)
+        plotter.render()
+        return mesh
 
     def model_bounds(self) -> np.ndarray:
         mesh, _ = self.node_mesh([self.model.root])
@@ -159,11 +187,11 @@ class SceneBuilder:
         if labels and label_pts:
             plotter.add_point_labels(np.array(label_pts), label_txt, font_size=int(13 * scale), point_size=1,
                                      shape_opacity=0.9, shape_color="white", text_color="#1F2023",
-                                     margin=4, always_visible=True, show_points=False)
+                                     margin=4, always_visible=True, show_points=False, **LABEL_KW)
         if labels and rem_pts:
             plotter.add_point_labels(np.array(rem_pts), rem_txt, font_size=int(13 * scale), point_size=1,
                                      shape_opacity=0.9, shape_color=COLOR_REMOVED, text_color="white",
-                                     margin=4, always_visible=True, show_points=False)
+                                     margin=4, always_visible=True, show_points=False, **LABEL_KW)
 
         if set_camera:
             self.apply_camera(plotter, step.camera, bounds)

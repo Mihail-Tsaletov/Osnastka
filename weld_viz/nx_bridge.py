@@ -9,6 +9,7 @@ import sys
 # в собранном exe файлы лежат в sys._MEIPASS, при запуске из исходников — в корне проекта
 _BASE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 JOURNAL = os.path.join(_BASE, "nx", "export_assembly.py")
+EXPORT_FORMAT = 2   # должен совпадать с "format" в nx/export_assembly.py
 
 
 def find_run_journal() -> str | None:
@@ -34,8 +35,10 @@ def is_export_fresh(prt_path: str) -> bool:
         return False
     try:
         with open(f, encoding="utf-8") as fh:
-            mtime = json.load(fh).get("source_mtime", 0)
-        return abs(mtime - os.path.getmtime(prt_path)) < 1e-3
+            data = json.load(fh)
+        if data.get("format", 1) != EXPORT_FORMAT:
+            return False   # выгрузка старой версией программы
+        return abs(data.get("source_mtime", 0) - os.path.getmtime(prt_path)) < 1e-3
     except Exception:
         return False
 

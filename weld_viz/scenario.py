@@ -31,6 +31,10 @@ class Scenario:
     model: str = ""                                 # путь к .prt (относительно файла сценария)
     fixture_main: str | None = None
     roles: dict[str, str] = field(default_factory=dict)
+    groups: dict[str, list[str]] = field(default_factory=dict)   # имя группы -> ключи тел/компонентов
+    split: list[str] = field(default_factory=list)   # узлы, разобранные на составляющие
+    # узел -> {"file": .prt замены, "matrix": 16 чисел (файл -> сборка), "summary": итог совмещения}
+    replacements: dict[str, dict] = field(default_factory=dict)
     steps: list[Step] = field(default_factory=list)
 
     def to_dict(self, base_dir: str | None) -> dict:
@@ -44,6 +48,10 @@ class Scenario:
             "model": model.replace("\\", "/"),
             "fixture_main": self.fixture_main,
             "roles": dict(self.roles),
+            "groups": {k: list(v) for k, v in self.groups.items()},
+            "split": list(self.split),
+            "replacements": {k: dict(v, file=self._rel(v.get("file", ""), base_dir))
+                             for k, v in self.replacements.items()},
             "steps": [
                 {k: v for k, v in {
                     "name": s.name,
@@ -56,6 +64,21 @@ class Scenario:
                 for s in self.steps
             ],
         }
+
+    @staticmethod
+    def _rel(file: str, base_dir: str | None) -> str:
+        if base_dir and file:
+            try:
+                file = os.path.relpath(file, base_dir)
+            except ValueError:
+                pass
+        return file.replace("\\", "/")
+
+    @staticmethod
+    def _abs(file: str, scenario_path: str) -> str:
+        if file and not os.path.isabs(file):
+            file = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(scenario_path)), file))
+        return file
 
     def save(self, path: str):
         with open(path, "w", encoding="utf-8") as f:
@@ -73,6 +96,10 @@ class Scenario:
             model=model,
             fixture_main=d.get("fixture_main"),
             roles=dict(d.get("roles") or {}),
+            groups={k: list(v) for k, v in (d.get("groups") or {}).items()},
+            split=list(d.get("split") or []),
+            replacements={k: dict(v, file=cls._abs(v.get("file", ""), path))
+                          for k, v in (d.get("replacements") or {}).items()},
             steps=[Step(name=s.get("name", ""), add=list(s.get("add") or []), show=list(s.get("show") or []),
                         hide=list(s.get("hide") or []),
                         direction=s.get("direction", "-Z"), camera=s.get("camera"))
