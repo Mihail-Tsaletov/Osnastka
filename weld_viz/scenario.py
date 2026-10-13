@@ -16,6 +16,43 @@ DIRECTIONS = {
 }
 
 
+def find_for_model(source: str) -> list[tuple[str, bool]]:
+    """Сценарии к модели: [(путь, та_же_модель)]. Сначала — с тем же полным путём к модели, затем — с тем же
+    именем файла модели (модель перенесли или открыли копию). Ищутся в папке сценариев и рядом с моделью."""
+    from . import nx_link, paths
+
+    def model_of(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                d = yaml.safe_load(f) or {}
+            m = d.get("model", "")
+            if m and not os.path.isabs(m) and not m.startswith("tc:"):
+                m = os.path.normpath(os.path.join(os.path.dirname(path), m))
+            return m
+        except Exception:
+            return None
+
+    files = []
+    folder = paths.scenarios_dir()
+    files += [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(paths.SCENARIO_EXT)]
+    if not nx_link.is_tc(source):
+        legacy = os.path.splitext(source)[0] + paths.SCENARIO_EXT   # версии до 0.4 — рядом с моделью
+        if os.path.exists(legacy):
+            files.append(legacy)
+    same_path = paths.norm(source) if not nx_link.is_tc(source) else source
+    stem = nx_link.model_stem(source).lower()
+    found = []
+    for path in files:
+        m = model_of(path)
+        if not m:
+            continue
+        exact = (m == source) if nx_link.is_tc(source) else (not m.startswith("tc:") and paths.norm(m) == same_path)
+        if exact or nx_link.model_stem(m).lower() == stem:
+            found.append((path, exact))
+    found.sort(key=lambda x: (not x[1], -os.path.getmtime(x[0])))
+    return found
+
+
 @dataclass
 class Step:
     name: str = ""
@@ -35,11 +72,12 @@ class Scenario:
     split: list[str] = field(default_factory=list)   # узлы, разобранные на составляющие
     # узел -> {"file": .prt замены, "matrix": 16 чисел (файл -> сборка), "summary": итог совмещения}
     replacements: dict[str, dict] = field(default_factory=dict)
+    color_mode: str = "roles"   # roles — цвета по ролям; nx — оснастка и детали цветами из NX
     steps: list[Step] = field(default_factory=list)
 
     def to_dict(self, base_dir: str | None) -> dict:
         model = self.model
-        if base_dir and model:
+        if base_dir and model and not model.startswith("tc:"):
             try:
                 model = os.path.relpath(model, base_dir)
             except ValueError:
@@ -50,6 +88,7 @@ class Scenario:
             "roles": dict(self.roles),
             "groups": {k: list(v) for k, v in self.groups.items()},
             "split": list(self.split),
+            "color_mode": self.color_mode,
             "replacements": {k: dict(v, file=self._rel(v.get("file", ""), base_dir))
                              for k, v in self.replacements.items()},
             "steps": [
@@ -90,7 +129,7 @@ class Scenario:
         with open(path, encoding="utf-8") as f:
             d = yaml.safe_load(f) or {}
         model = d.get("model", "")
-        if model and not os.path.isabs(model):
+        if model and not os.path.isabs(model) and not model.startswith("tc:"):
             model = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(path)), model))
         return cls(
             model=model,
@@ -98,6 +137,7 @@ class Scenario:
             roles=dict(d.get("roles") or {}),
             groups={k: list(v) for k, v in (d.get("groups") or {}).items()},
             split=list(d.get("split") or []),
+            color_mode=d.get("color_mode", "roles"),
             replacements={k: dict(v, file=cls._abs(v.get("file", ""), path))
                           for k, v in (d.get("replacements") or {}).items()},
             steps=[Step(name=s.get("name", ""), add=list(s.get("add") or []), show=list(s.get("show") or []),

@@ -138,14 +138,26 @@ def export_pdf(path: str, scenario: Scenario, cls: Classifier, scene: SceneBuild
         ly = M + 83
         c.setFont(FONT_BOLD, 9)
         c.drawString(x, ly, "Обозначения:")
-        for color, text in ((COLOR_PART_NEW, "закладываемая деталь"),
-                            (COLOR_PART_DONE, "уже заложенные детали"),
-                            (COLOR_MOVABLE, "прижимы / подвижные элементы"),
-                            (COLOR_FIXTURE, "оснастка"),
-                            (COLOR_REMOVED, "убрать (полупрозрачно, тёмная стрелка)")):
+        if getattr(scenario, "color_mode", "roles") == "nx":
+            legend = ((COLOR_PART_NEW, "закладываемая деталь"),
+                      (COLOR_MOVABLE, "стрелка — новый прижим этапа"),
+                      (None, "остальное — цвета модели NX"),
+                      (COLOR_REMOVED, "убрать (полупрозрачно, тёмная стрелка)"))
+        else:
+            legend = ((COLOR_PART_NEW, "закладываемая деталь"),
+                      (COLOR_PART_DONE, "уже заложенные детали"),
+                      (COLOR_MOVABLE, "прижимы / подвижные элементы"),
+                      (COLOR_FIXTURE, "оснастка"),
+                      (COLOR_REMOVED, "убрать (полупрозрачно, тёмная стрелка)"))
+        for color, text in legend:
             ly -= 13
-            c.setFillColor(color)
-            c.rect(x, ly - 1, 9, 9, stroke=0, fill=1)
+            if color:
+                c.setFillColor(color)
+                c.rect(x, ly - 1, 9, 9, stroke=0, fill=1)
+            else:  # «цвета NX» — разноцветный значок
+                for k, col in enumerate(("#3d5fca", "#47a523", "#d3837f")):
+                    c.setFillColor(col)
+                    c.rect(x + k * 3, ly - 1, 3, 9, stroke=0, fill=1)
             c.setFillColorRGB(0, 0, 0)
             c.setFont(FONT, 9)
             c.drawString(x + 14, ly, text)

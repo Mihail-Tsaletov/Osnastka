@@ -1,11 +1,13 @@
 """Построение 3D-сцены этапа (PyVista): оснастка, детали, прижимы, стрелки."""
 from __future__ import annotations
 
+import inspect
 import os
 from collections import OrderedDict
 
 import numpy as np
 import pyvista as pv
+from vtkmodules.vtkCommonCore import VTK_FONT_FILE
 from vtkmodules.vtkRenderingCore import vtkMapper
 
 # рёбра поверх граней без мерцания
@@ -26,8 +28,24 @@ COLOR_BG = "white"
 DEFAULT_VIEW = np.array([0.75, -1.0, 0.85])
 COLOR_SELECTION = "#1E88E5"
 LABEL_FONT = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arial.ttf")
-LABEL_KW = {"font_file": LABEL_FONT} if os.path.exists(LABEL_FONT) else {}   # кириллица в подписях
 MERGE_CACHE_SIZE = 48
+
+
+def add_labels(plotter: pv.Plotter, points, texts, **kw):
+    """Подписи с кириллицей (шрифт Arial). Старый PyVista (сборка для Windows 7) не знает font_file —
+    тогда шрифт задаётся свойству текста VTK напрямую."""
+    has_font = os.path.exists(LABEL_FONT)
+    if has_font and "font_file" in inspect.signature(plotter.add_point_labels).parameters:
+        return plotter.add_point_labels(points, texts, font_file=LABEL_FONT, **kw)
+    actor = plotter.add_point_labels(points, texts, **kw)
+    if has_font:
+        try:
+            prop = actor.GetMapper().GetInputAlgorithm().GetTextProperty()
+            prop.SetFontFamily(VTK_FONT_FILE)
+            prop.SetFontFile(LABEL_FONT)
+        except Exception:
+            pass
+    return actor
 
 
 class SceneBuilder:
@@ -69,6 +87,27 @@ class SceneBuilder:
             self._merged.popitem(last=False)
         return mesh, edge
 
+    def meshes_by_color(self, nodes: list[Node], cls: Classifier, role: str):
+        """Сетки узлов с ролью role, сгруппированные по цвету NX: [(rgb | None, сетка, рёбра)]."""
+        groups: dict = {}
+        for top in nodes:
+            for n in top.walk():
+                if n.mesh and cls.role(n) == role:
+                    groups.setdefault(self.model.rgb(n), []).append(n.mesh)
+        out = []
+        for rgb, files in groups.items():
+            key = ("color",) + tuple(files)
+            if key not in self._merged:
+                meshes = [self._leaf_mesh(f) for f in files]
+                edges = [self._edges[f] for f in files if self._edges[f].n_points]
+                self._merged[key] = (meshes[0] if len(meshes) == 1 else pv.merge(meshes),
+                                     (edges[0] if len(edges) == 1 else pv.merge(edges)) if edges else None)
+                if len(self._merged) > MERGE_CACHE_SIZE:
+                    self._merged.popitem(last=False)
+            mesh, edge = self._merged[key]
+            out.append((rgb, mesh, edge))
+        return out
+
     def highlight(self, plotter: pv.Plotter, nodes: list[Node]):
         """Подсветка выбранных узлов (поверх сцены, без перестроения)."""
         for name in ("__sel_mesh__", "__sel_box__"):
@@ -97,13 +136,24 @@ class SceneBuilder:
         bounds = self.model_bounds()
         diag = float(np.linalg.norm(bounds[1::2] - bounds[0::2])) or 1.0
 
-        def add(nodes, color, role):
+        nx_colors = getattr(scenario, "color_mode", "roles") == "nx"
+
+        def add(nodes, color, role, keep=False):
+            """keep — всегда цвет инструкции (закладываемая деталь), даже в режиме «цвета NX»."""
+            if nx_colors and not keep:
+                for rgb, mesh, edges in self.meshes_by_color(nodes, cls, role):
+                    plotter.add_mesh(mesh, color=rgb or color, smooth_shading=False, specular=0.2, ambient=0.3,
+                                     diffuse=0.75)
+                    if edges is not None:
+                        plotter.add_mesh(edges, color=COLOR_EDGES, line_width=line_width)
+                return None
             mesh, edges = self.node_mesh(nodes, cls, role)
             if mesh is None:
                 return None
             plotter.add_mesh(mesh, color=color, smooth_shading=False, specular=0.2, ambient=0.3, diffuse=0.75)
             if edges is not None:
-                plotter.add_mesh(edges, color=COLOR_EDGES, line_width=line_width)
+                # среди цветов NX закладываемую деталь выделяет ещё и толстый контур
+                plotter.add_mesh(edges, color=COLOR_EDGES, line_width=line_width * (2.5 if keep and nx_colors else 1))
             return mesh
 
         add([self.model.root], COLOR_FIXTURE, FIXTURE)
@@ -132,7 +182,7 @@ class SceneBuilder:
         label_pts, label_txt = [], []
 
         for n in new:
-            mesh = add([n], COLOR_PART_NEW, PART)
+            mesh = add([n], COLOR_PART_NEW, PART, keep=True)
             if mesh is None:
                 continue
             tip = self._entry_point(mesh, direction) - direction * gap
@@ -185,13 +235,13 @@ class SceneBuilder:
                 rem_txt.append(n.short_label)
 
         if labels and label_pts:
-            plotter.add_point_labels(np.array(label_pts), label_txt, font_size=int(13 * scale), point_size=1,
-                                     shape_opacity=0.9, shape_color="white", text_color="#1F2023",
-                                     margin=4, always_visible=True, show_points=False, **LABEL_KW)
+            add_labels(plotter, np.array(label_pts), label_txt, font_size=int(13 * scale), point_size=1,
+                       shape_opacity=0.9, shape_color="white", text_color="#1F2023",
+                       margin=4, always_visible=True, show_points=False)
         if labels and rem_pts:
-            plotter.add_point_labels(np.array(rem_pts), rem_txt, font_size=int(13 * scale), point_size=1,
-                                     shape_opacity=0.9, shape_color=COLOR_REMOVED, text_color="white",
-                                     margin=4, always_visible=True, show_points=False, **LABEL_KW)
+            add_labels(plotter, np.array(rem_pts), rem_txt, font_size=int(13 * scale), point_size=1,
+                       shape_opacity=0.9, shape_color=COLOR_REMOVED, text_color="white",
+                       margin=4, always_visible=True, show_points=False)
 
         if set_camera:
             self.apply_camera(plotter, step.camera, bounds)

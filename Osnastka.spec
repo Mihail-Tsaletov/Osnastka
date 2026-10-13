@@ -12,7 +12,6 @@ a = Analysis(
     [os.path.join(ROOT, "osnastka.py")],
     pathex=[ROOT],
     datas=[
-        (os.path.join(ROOT, "nx", "export_assembly.py"), "nx"),
         (os.path.join(ROOT, "assets", "osnastka.png"), "assets"),
     ] + collect_data_files("pyvista"),
     hiddenimports=collect_submodules("vtkmodules") + ["pyvistaqt", "qtpy"],
@@ -31,3 +30,23 @@ exe = EXE(
     upx=False,
 )
 coll = COLLECT(exe, a.binaries, a.datas, name="Osnastka", upx=False)
+
+# журнал NX (C#) — рядом с Osnastka.exe, в папке nx: программа берёт его оттуда, его же выбирают для кнопки в NX
+import shutil  # noqa: E402
+_nx_out = os.path.join(DISTPATH, "Osnastka", "nx")
+os.makedirs(_nx_out, exist_ok=True)
+shutil.copy2(os.path.join(ROOT, "nx", "osnastka_nx.cs"), _nx_out)
+
+# сборка для Windows 7 (собирается Python 3.8): универсальная библиотека C (UCRT) рядом с exe —
+# на Windows 7 без обновлений её нет (официальное локальное развёртывание Microsoft)
+import glob  # noqa: E402
+import sys  # noqa: E402
+
+if sys.version_info < (3, 9):
+    kits = r"C:\Program Files (x86)\Windows Kits\10\Redist"
+    dirs = sorted(glob.glob(os.path.join(kits, "*", "ucrt", "DLLs", "x64"))) + \
+        glob.glob(os.path.join(kits, "ucrt", "DLLs", "x64"))
+    if not dirs:
+        raise SystemExit("Нет UCRT (Windows 10 SDK, Redist\\ucrt\\DLLs\\x64) — нужен для сборки под Windows 7")
+    for dll in glob.glob(os.path.join(dirs[-1], "*.dll")):
+        shutil.copy2(dll, os.path.join(DISTPATH, "Osnastka"))

@@ -6,3 +6,6 @@ __pycache__/
 .idea/
 build/
 dist/
+.py38/
+.venv38/
+dist_win7/

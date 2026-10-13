@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 import os
 
-from . import nx_bridge, replace
+from . import nx_bridge, nx_link, replace
 from .model import AssemblyModel, Classifier
 from .pdf_report import export_pdf
 from .scenario import Scenario
@@ -31,7 +31,7 @@ def main():
     model.apply_groups(sc.groups)
     cls = Classifier(model, sc.fixture_main, sc.roles, sc.split)
     out = a.output or os.path.splitext(a.scenario)[0] + ".pdf"
-    export_pdf(out, sc, cls, SceneBuilder(model), title=os.path.basename(sc.model),
+    export_pdf(out, sc, cls, SceneBuilder(model), title=nx_link.model_title(sc.model),
                progress=lambda i, n: print(f"  этап {i}/{n}"))
     print("PDF:", out)
 

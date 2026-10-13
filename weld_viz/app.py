@@ -2,25 +2,24 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import threading
 import time
 
-os.environ.setdefault("QT_API", "pyside6")
-
-from PySide6.QtCore import QEvent, QObject, QProcess, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, QPixmap
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
+from qtpy.QtCore import QEvent, QObject, QProcess, Qt, QTimer, Signal
+from qtpy.QtGui import QAction, QBrush, QColor, QFont, QIcon, QKeySequence, QPixmap
+from qtpy.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
                                QInputDialog,                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
                                QProgressDialog, QPushButton, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
                                QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 from pyvistaqt import QtInteractor
 
-from . import __version__, nx_bridge, replace, theme, updater
+from . import __version__, nx_bridge, nx_link, paths, replace, theme, updater
 from .model import (FIXTURE, GROUP_PREFIX, HIDDEN, MOVABLE, PART, ROLE_TITLES, AssemblyModel, Classifier, Node,
                     prefix_of)
 from .pdf_report import export_pdf
-from .scenario import DIRECTIONS, Scenario, Step
+from .scenario import DIRECTIONS, Scenario, Step, find_for_model
 from .scene import COLOR_FIXTURE, COLOR_MOVABLE, COLOR_PART_NEW, SceneBuilder
 
 APP_TITLE = "Закладка в оснастку"
@@ -67,7 +66,8 @@ class UpdateSignals(QObject):
 
 
 def scenario_path_for(prt: str) -> str:
-    return os.path.splitext(prt)[0] + ".weldviz.yaml"
+    """Путь для нового сценария: «Документы\\Osnastka\\Сценарии» (папка модели может быть только для чтения)."""
+    return paths.new_scenario_path(nx_link.model_stem(prt))
 
 
 class MainWindow(QMainWindow):
@@ -96,6 +96,7 @@ class MainWindow(QMainWindow):
         self._sel_timer.setSingleShot(True)
         self._sel_timer.timeout.connect(self._apply_selection)
         self._fresh_export = False
+        self._wheel_filter_global = NoWheelUnlessFocused(self)
 
         self._pending_update = None
         self._upd = UpdateSignals(self)
@@ -131,6 +132,10 @@ class MainWindow(QMainWindow):
         act("Сохранить", self.save, "Ctrl+S", "Сохранить сценарий — Ctrl+S")
         act("Сохранить как", self.save_as)
         tb.addSeparator()
+        act("Окно выбора", self.open_picker,
+            tip="Отдельное окно с моделью: щелчок по детали выбирает её в списке")
+        act("Кнопка в NX", self.show_nx_button_help,
+            tip="Как передавать модель прямо из открытого NX (в том числе из Teamcenter)")
         act("Обновить из NX", lambda: self.run_nx_export(force=True),
             tip="Заново выгрузить сборку из NX (если меняли подсборки или детали)")
         act("Обновления", lambda: self.check_updates(manual=True),
@@ -201,6 +206,16 @@ class MainWindow(QMainWindow):
         self.btn_remove = button("Удалить этап", self.remove_step, "Удалить текущий этап")
         # перестановка и вставка этапов — только из меню заголовка столбца, чтобы не путать с переходом
         row1.addStretch()
+        self.color_mode = QComboBox()
+        self.color_mode.addItem("Цвета: по ролям", "roles")
+        self.color_mode.addItem("Цвета: как в NX", "nx")
+        self.color_mode.setToolTip("«Как в NX» — оснастка и детали своими цветами из NX; закладываемая деталь, "
+                                   "стрелки и убираемое — цветами инструкции. Действует и на PDF.")
+        self.color_mode.setFocusPolicy(Qt.StrongFocus)
+        self.color_mode.installEventFilter(self._wheel_filter_global)
+        self.color_mode.currentIndexChanged.connect(self._color_mode_changed)
+        row1.addWidget(self.color_mode)
+        row1.addSpacing(10)
         self.show_all = QCheckBox("Показать всю сборку")
         self.show_all.setCursor(Qt.PointingHandCursor)
         self.show_all.toggled.connect(self._show_all_toggled)
@@ -282,13 +297,21 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(label(f"версия {__version__}", "hint"))
         self.statusBar().showMessage("Откройте сборку NX (.prt) или сценарий (.yaml)")
 
+    def _color_mode_changed(self, _):
+        if self._updating or not self.model:
+            return
+        self.scenario.color_mode = self.color_mode.currentData()
+        self.mark_dirty()
+        self.refresh_view()
+
     def _show_all_toggled(self, on):
         if on:
             self._remember_view()
         self.refresh_view(reset_camera=True)
 
     def _update_title(self):
-        name = os.path.basename(self.scenario_path or self.prt_path or "") or "без имени"
+        name = (os.path.basename(self.scenario_path) if self.scenario_path
+                else nx_link.model_title(self.prt_path or "")) or "без имени"
         self.setWindowTitle(f"{APP_TITLE} {__version__} — {name}{' *' if self.dirty else ''}")
 
     def mark_dirty(self):
@@ -311,14 +334,31 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Сборка NX", "", "Сборка NX (*.prt)")
         if not path:
             return
-        sc_path = scenario_path_for(path)
-        if os.path.exists(sc_path):
-            r = QMessageBox.question(self, APP_TITLE, f"Найден сценарий {os.path.basename(sc_path)}. Открыть его?")
-            if r == QMessageBox.Yes:
-                self._load_scenario_file(sc_path)
+        self._open_model(path)
+
+    def _open_model(self, source, intro=""):
+        """Открыть модель: если для неё есть сценарии — предложить открыть один из них."""
+        found = find_for_model(source)
+        if found:
+            new = "Новый сценарий"
+            items = [f"{os.path.basename(p)} — " + ("та же модель" if exact else
+                                                    "модель с таким же именем из другой папки")
+                     for p, exact in found] + [new]
+            if len(found) == 1 and found[0][1]:
+                r = QMessageBox.question(self, APP_TITLE, intro + f"Для этой модели есть сценарий "
+                                         f"«{os.path.basename(found[0][0])}». Открыть его?\n\n«Нет» — новый сценарий.")
+                choice = items[0] if r == QMessageBox.Yes else new
+            else:
+                choice, ok = QInputDialog.getItem(self, APP_TITLE, intro + "Для этой модели найдены сценарии:",
+                                                  items, 0, False)
+                if not ok:
+                    return
+            if choice != new:
+                path = found[items.index(choice)][0]
+                self._load_scenario_file(path, model_override=source)
                 return
         self.scenario_path = None
-        self._start(path, Scenario(model=path))
+        self._start(source, Scenario(model=source))
 
     def open_scenario(self):
         if not self._confirm_discard():
@@ -327,20 +367,64 @@ class MainWindow(QMainWindow):
         if path:
             self._load_scenario_file(path)
 
-    def _load_scenario_file(self, path):
+    def _load_scenario_file(self, path, model_override=None):
         try:
             sc = Scenario.load(path)
         except Exception as e:
             QMessageBox.critical(self, APP_TITLE, f"Не удалось прочитать сценарий:\n{e}")
             return
-        if not os.path.exists(sc.model):
-            QMessageBox.critical(self, APP_TITLE, f"Не найдена сборка:\n{sc.model}")
+        if model_override:   # сценарий к модели с тем же именем, открытой из другой папки
+            sc.model = model_override
+        exists = nx_bridge.is_export_fresh(sc.model) if nx_link.is_tc(sc.model) else os.path.exists(sc.model)
+        if not exists:
+            QMessageBox.critical(self, APP_TITLE, f"Не найдена сборка:\n{nx_link.model_title(sc.model)}\n\n"
+                                                  f"Для модели из Teamcenter откройте её в NX и нажмите кнопку Osnastka.")
             return
         self.scenario_path = path
         self._start(sc.model, sc)
 
+    # ------------------------------------------------------------ модель из открытого NX
+    def _watch_inbox(self):
+        from qtpy.QtCore import QFileSystemWatcher
+        self._inbox_watcher = QFileSystemWatcher([nx_link.INBOX], self)
+        self._inbox_watcher.directoryChanged.connect(lambda *_: QTimer.singleShot(300, self.take_nx_request))
+        QTimer.singleShot(500, self.take_nx_request)   # запрос, пришедший до запуска программы
+
+    def take_nx_request(self):
+        req = nx_link.take_request()
+        if not req:
+            return
+        self.raise_()
+        self.activateWindow()
+        source = req.get("source", "")
+        if not self._confirm_discard():
+            return
+        # выгрузка из сеанса NX лежит во временной папке — перенести в кэш программы
+        src_dir, dst_dir = req.get("export_dir", ""), nx_bridge.export_dir_for(source)
+        if src_dir and os.path.isdir(src_dir) and paths.norm(src_dir) != paths.norm(dst_dir):
+            shutil.rmtree(dst_dir, ignore_errors=True)
+            os.makedirs(os.path.dirname(dst_dir), exist_ok=True)
+            shutil.move(src_dir, dst_dir)
+        self._open_model(source, intro=f"Из NX пришла модель «{nx_link.model_title(source)}».\n\n")
+
+    def show_nx_button_help(self):
+        QApplication.clipboard().setText(nx_link.JOURNAL)
+        QMessageBox.information(
+            self, APP_TITLE,
+            "Модель можно передать прямо из открытого NX — и из обычного, и из NX с Teamcenter "
+            "(режим определяется сам, сохранять модель локально не нужно).\n\n"
+            "Журнал для кнопки (C#, лежит в папке программы; путь уже скопирован в буфер обмена):\n"
+            f"{nx_link.JOURNAL}\n\n"
+            "Быстрый способ: в NX нажмите Alt+F8 («Воспроизвести журнал»; или вкладка «Разработка» → "
+            "«Журнал» → «Воспроизвести»), нажмите «Обзор», выберите этот файл и «Выполнить». "
+            "NX запоминает последний журнал — в следующий раз только Alt+F8 → «Выполнить».\n\n"
+            "Постоянная кнопка: в NX «Настройка» (Ctrl+1) → вкладка «Команды» → категория «Новый элемент» → "
+            "перетащите «Новая пользовательская команда» на ленту → правый клик по ней → «Изменить действие» → "
+            "тип «Журнал» → вставьте путь из буфера обмена.\n\n"
+            "Нажали кнопку в NX — модель выгрузится и откроется здесь. После изменений в NX нажмите её снова.")
+
     def _start(self, prt, scenario: Scenario):
-        self.prt_path = os.path.abspath(prt)
+        self.prt_path = prt if nx_link.is_tc(prt) else os.path.abspath(prt)
         self.dirty = False
         scenario.model = self.prt_path
         self._pending_scenario = scenario
@@ -356,7 +440,13 @@ class MainWindow(QMainWindow):
             return self.save_as()
         self._remember_view()
         self._cleanup_scenario()
-        self.scenario.save(self.scenario_path)
+        try:
+            self.scenario.save(self.scenario_path)
+        except OSError as e:
+            QMessageBox.warning(self, APP_TITLE, f"Не удалось сохранить сценарий (папка только для чтения?):\n"
+                                                 f"{self.scenario_path}\n{e}\n\nВыберите другое место.")
+            self.scenario_path = None
+            return self.save_as()
         self.dirty = False
         self._update_title()
         self.statusBar().showMessage(f"Сохранено: {self.scenario_path}", 5000)
@@ -459,6 +549,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         if self._confirm_discard():
+            if getattr(self, "picker", None) is not None:
+                self.picker.plotter.close()
+                self.picker.deleteLater()
             self.plotter.close()
             e.accept()
         else:
@@ -478,6 +571,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, APP_TITLE, str(e))
             return
         self._export_on_done = on_done
+        self._export_target, self._export_started = target, time.time()
         self._progress = QProgressDialog(f"Выгрузка из NX: {os.path.basename(target)}…\n"
                                          f"Это может занять до нескольких минут.", None, 0, 0, self)
         self._progress.setWindowTitle(APP_TITLE)
@@ -491,7 +585,7 @@ class MainWindow(QMainWindow):
     def _on_export_finished(self, code, _status):
         out = bytes(self._process.readAll()).decode("cp1251", errors="replace")
         self._progress.close()
-        if "EXPORT_OK" not in out:
+        if not nx_bridge.export_succeeded(self._export_target, out, self._export_started):
             QMessageBox.critical(self, APP_TITLE, "Экспорт из NX не удался:\n\n" + out[-2500:])
             return
         on_done, self._export_on_done = getattr(self, "_export_on_done", None), None
@@ -522,6 +616,9 @@ class MainWindow(QMainWindow):
         if not sc.steps:
             sc.steps.append(Step(name="Установить базовую деталь"))
         self.scenario = sc
+        self._updating = True
+        self.color_mode.setCurrentIndex(max(0, self.color_mode.findData(sc.color_mode)))
+        self._updating = False
         repl_warnings = replace.apply_all(self.model, sc)
         skipped = self.model.apply_groups(sc.groups)
         self.dirty = self.dirty or self.scenario_path is None
@@ -529,6 +626,9 @@ class MainWindow(QMainWindow):
         self._reclassify()
         self.select_step(0)
         self._update_title()
+        if getattr(self, "picker", None) is not None and self.picker.isVisible():
+            self.picker.setWindowTitle(f"Выбор по модели — {nx_link.model_title(self.prt_path)}")
+            self.picker.rebuild(reset_camera=True)
         fresh, self._fresh_export = self._fresh_export, False
         if fresh and self.model.missing:
             QMessageBox.information(self, APP_TITLE, self._missing_text(20))
@@ -552,6 +652,8 @@ class MainWindow(QMainWindow):
         self.cls = Classifier(self.model, self.scenario.fixture_main, self.scenario.roles, self.scenario.split)
         self._fill_tree()
         self._fill_table()
+        if getattr(self, "picker", None) is not None and self.picker.isVisible():
+            self.picker.rebuild()
 
     def _fill_tree(self):
         self._updating = True
@@ -577,10 +679,11 @@ class MainWindow(QMainWindow):
                 f.setItalic(True)
                 item.setFont(0, f)
                 tips.append("Группа — правый клик: переименовать, разгруппировать")
-            rgb = self.model.rgb(node)
-            if rgb:  # цвет тела в NX — только в подсказке, чтобы не путать с цветом роли
-                hexc = QColor.fromRgbF(*rgb).name()
-                tips.append(f"Цвет тела в NX: <span style='color:{hexc}'>■■■</span> (№{node.color})")
+            for title, idx in (("Цвет в сборке NX", node.color), ("Цвет в файле детали", node.part_color)):
+                rgb = self.model.palette.get(idx) if idx is not None else None
+                if rgb and (title.startswith("Цвет в сборке") or node.part_color != node.color):
+                    hexc = QColor.fromRgbF(*rgb).name()   # только в подсказке — не путать с цветом роли
+                    tips.append(f"{title}: <span style='color:{hexc}'>■■■</span> (№{idx})")
             role = self.cls.role(node)
             if role:
                 item.setIcon(0, role_icon(role))
@@ -661,9 +764,9 @@ class MainWindow(QMainWindow):
                                ).triggered.connect(lambda: self._split(node))
             menu.addSeparator()
 
-        if len(nodes) == 1 and nodes[0].color is not None and nodes[0].parent is not None:
+        if len(nodes) == 1 and nodes[0].part_color is not None and nodes[0].parent is not None:
             body = nodes[0]
-            same = [c for c in body.parent.children if c.color == body.color]
+            same = [c for c in body.parent.children if c.part_color == body.part_color]
             if len(same) > 1:
                 menu.addAction(f"Выделить тела того же цвета ({len(same)} шт.)").triggered.connect(
                     lambda: self.select_in_tree([c.key for c in same]))
@@ -705,7 +808,7 @@ class MainWindow(QMainWindow):
             a.triggered.connect(lambda: self._set_role(mkeys, None))
             menu.addSeparator()
         menu.addAction("Приблизить в 3D").triggered.connect(self.focus_selection)
-        menu.exec(self.tree.viewport().mapToGlobal(pos))
+        theme.popup(menu, self.tree.viewport().mapToGlobal(pos))
 
     def _set_fixture_main(self, key):
         self.scenario.fixture_main = key
@@ -932,6 +1035,8 @@ class MainWindow(QMainWindow):
         nodes = [self.model.by_key[k] for k in self._selected_keys() if k in self.model.by_key]
         nodes = [n for n in nodes if n.parent is not None]   # корень = вся модель — не подсвечиваем
         self.scene.highlight(self.plotter, nodes)
+        if getattr(self, "picker", None) is not None and self.picker.isVisible():
+            self.picker.show_selection([n.key for n in nodes])
         if nodes:
             self.statusBar().showMessage(f"Выбрано: {len(nodes)}", 3000)
 
@@ -940,7 +1045,10 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(self._rows) and self._rows[row][0] != "header":
             self.select_in_tree([self._rows[row][1].key])
 
-    def select_in_tree(self, keys):
+    def select_in_tree(self, keys, reveal=False):
+        """Выбрать узлы в дереве (подсветка в 3D идёт от выбора в дереве). reveal — показать строку таблицы."""
+        if reveal:
+            self._reveal_rows(keys)
         keys = set(keys)
         self.tree.clearSelection()
         first = None
@@ -953,6 +1061,72 @@ class MainWindow(QMainWindow):
             stack.extend(it.child(i) for i in range(it.childCount()))
         if first is not None:
             self.tree.scrollToItem(first)
+
+    def _reveal_rows(self, keys):
+        keys = set(keys)
+        for r, (kind, obj) in enumerate(self._rows):
+            if kind != "header" and obj.key in keys:
+                self.table.scrollToItem(self.table.item(r, 0))
+                self.table.verticalHeader().setHighlightSections(True)
+                break
+
+    # ------------------------------------------------------------- окно выбора по модели
+    def open_picker(self):
+        if not self.model:
+            QMessageBox.information(self, APP_TITLE, "Сначала откройте сборку.")
+            return
+        if getattr(self, "picker", None) is None:
+            from .picker import PickerWindow
+            self.picker = PickerWindow(self)
+            g = self.geometry()
+            self.picker.move(g.x() + g.width() - self.picker.width() - 20, g.y() + 60)
+        self.picker.setWindowTitle(f"Выбор по модели — {nx_link.model_title(self.prt_path)}")
+        self.picker.show()
+        self.picker.raise_()
+        self.picker.rebuild(reset_camera=True)
+
+    def apply_to_current_step(self, keys, on: bool):
+        """Кнопки окна выбора: детали — заложить на текущем этапе / снять; прижимы — показать / скрыть."""
+        cur = self.current_step
+        if cur is None or not self.model:
+            return
+        parts = {n.key for n in self.cls.units(PART)}
+        movables = {n.key for n in self.cls.units(MOVABLE)}
+        step = self.scenario.steps[cur]
+        done, skipped = 0, 0
+        for k in keys:
+            if k in parts:
+                placed = self.scenario.step_of_part(k)
+                if on and placed != cur:
+                    for st in self.scenario.steps:
+                        if k in st.add:
+                            st.add.remove(k)
+                    for st in self.scenario.steps[:cur + 1]:
+                        if k in st.hide:
+                            st.hide.remove(k)
+                    step.add.append(k)
+                    done += 1
+                elif not on and placed == cur:
+                    step.add.remove(k)
+                    done += 1
+            elif k in movables:
+                if on and k not in step.show:
+                    step.show.append(k)
+                    done += 1
+                elif not on and k in step.show:
+                    step.show.remove(k)
+                    done += 1
+            else:
+                skipped += 1
+        if done:
+            self.mark_dirty()
+            self._sync_table()
+            self.refresh_view()
+        msg = f"Этап {cur + 1}: изменено {done}"
+        if skipped:
+            msg += f"; пропущено {skipped} — это не строки таблицы (оснастка или часть детали). " \
+                   f"Назначьте роль или выберите «как в таблице»."
+        self.statusBar().showMessage(msg, 6000)
 
     def focus_selection(self):
         nodes = [self.model.by_key[k] for k in self._selected_keys() if self.model and k in self.model.by_key]
@@ -1127,7 +1301,7 @@ class MainWindow(QMainWindow):
         a = menu.addAction(f"Удалить этап {col + 1}")
         a.setEnabled(n > 1)
         a.triggered.connect(self.remove_step)
-        menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
+        theme.popup(menu, self.table.horizontalHeader().mapToGlobal(pos))
 
     def _header_clicked(self, col):
         if col != self.current_step:
@@ -1153,7 +1327,7 @@ class MainWindow(QMainWindow):
                 text += f" (перенести с этапа {placed + 1})"
             menu.addAction(text).triggered.connect(lambda: self._place_part(key, col))
         menu.addAction("Подсветить в 3D").triggered.connect(lambda: self.select_in_tree([key]))
-        menu.exec(self.table.viewport().mapToGlobal(pos))
+        theme.popup(menu, self.table.viewport().mapToGlobal(pos))
 
     def _place_part(self, key, col):
         """Закладка детали на этапе col (None — снять закладку)."""
@@ -1356,7 +1530,8 @@ class MainWindow(QMainWindow):
     def export_pdf(self):
         if not self.model:
             return
-        base = os.path.splitext(self.scenario_path or self.prt_path)[0]
+        base = (os.path.splitext(self.scenario_path)[0].replace(paths.SCENARIO_EXT[:-5], "")
+                if self.scenario_path else os.path.join(paths.scenarios_dir(), nx_link.model_stem(self.prt_path)))
         path, _ = QFileDialog.getSaveFileName(self, "Экспорт PDF", base + ".pdf", "PDF (*.pdf)")
         if not path:
             return
@@ -1372,7 +1547,7 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
 
         try:
-            export_pdf(path, self.scenario, self.cls, self.scene, title=os.path.basename(self.prt_path),
+            export_pdf(path, self.scenario, self.cls, self.scene, title=nx_link.model_title(self.prt_path),
                        progress=progress)
         except PermissionError:
             dlg.close()
@@ -1391,8 +1566,10 @@ def main():
     except AttributeError:
         pass
     theme.apply(app)
+    nx_link.register_app()
     w = MainWindow()
     w.show()
+    w._watch_inbox()
     if len(sys.argv) > 1:
         arg = sys.argv[1]
         if arg.lower().endswith((".yaml", ".yml")):

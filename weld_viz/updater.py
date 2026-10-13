@@ -29,7 +29,10 @@ from dataclasses import dataclass
 from . import __version__
 
 DEFAULT_CONFIG = {"github": "Mihail-Tsaletov/Osnastka"}
-ASSET_PREFIX = "Osnastka-"
+# сборка для Windows 7 (Python 3.8 + Qt 5) обновляется своим архивом Osnastka-win7-<версия>.zip
+WIN7_BUILD = sys.version_info < (3, 9)
+ASSET_PREFIX = "Osnastka-win7-" if WIN7_BUILD else "Osnastka-"
+ASSET_RE = re.compile(r"^Osnastka-win7-\d[\d.]*\.zip$" if WIN7_BUILD else r"^Osnastka-\d[\d.]*\.zip$")
 EXE_NAME = "Osnastka.exe"
 APPLY_FLAG = "--apply-update"
 FROZEN = getattr(sys, "frozen", False)
@@ -83,7 +86,10 @@ def latest_release() -> Release | None:
             return None
         with open(info_path, encoding="utf-8-sig") as f:
             info = json.load(f)
-        return Release(info["version"], os.path.join(cfg["folder"], info["file"]), info.get("notes", ""))
+        file = info.get("file_win7") if WIN7_BUILD else info.get("file")
+        if not file:
+            return None
+        return Release(info["version"], os.path.join(cfg["folder"], file), info.get("notes", ""))
 
     repo = cfg.get("github")
     if not repo:
@@ -97,8 +103,7 @@ def latest_release() -> Release | None:
         if e.code == 404:
             return None  # релизов нет (или закрытый репозиторий без токена)
         raise
-    asset = next((a for a in data.get("assets", [])
-                  if a["name"].startswith(ASSET_PREFIX) and a["name"].endswith(".zip")), None)
+    asset = next((a for a in data.get("assets", []) if ASSET_RE.match(a["name"])), None)
     if asset is None:
         return None
     if cfg.get("token"):  # закрытый репозиторий: скачивание через API
@@ -179,13 +184,19 @@ def apply_update(target_dir: str, old_pid: int):
         time.sleep(0.5)
     time.sleep(0.5)
     my_dir = os.path.dirname(sys.executable)
-    _replace_dir(os.path.join(my_dir, "_internal"), os.path.join(target_dir, "_internal"))
-    for attempt in range(20):
-        try:
-            shutil.copy2(sys.executable, os.path.join(target_dir, EXE_NAME))
-            break
-        except OSError:
-            time.sleep(0.5)
+    # всё содержимое новой версии: _internal, nx (журнал NX), DLL рядом с exe (сборка для Windows 7), exe;
+    # файлы пользователя в папке программы (update.json) не трогаются — их нет в новой версии
+    for name in os.listdir(my_dir):
+        src, dst = os.path.join(my_dir, name), os.path.join(target_dir, name)
+        if os.path.isdir(src):
+            _replace_dir(src, dst)
+            continue
+        for attempt in range(20):
+            try:
+                shutil.copy2(src, dst)
+                break
+            except OSError:
+                time.sleep(0.5)
     subprocess.Popen([os.path.join(target_dir, EXE_NAME)], cwd=target_dir, close_fds=True,
                      creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
 

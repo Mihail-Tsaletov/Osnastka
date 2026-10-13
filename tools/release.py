@@ -30,6 +30,16 @@ def run(*cmd, check=True, capture=False):
     return r
 
 
+def make_zip(app_dir: str, zip_path: str) -> str:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        for root, _, files in os.walk(app_dir):
+            for name in files:
+                full = os.path.join(root, name)
+                z.write(full, os.path.join("Osnastka", os.path.relpath(full, app_dir)))
+    print("Архив:", zip_path, f"{os.path.getsize(zip_path) / 2**20:.0f} МБ")
+    return zip_path
+
+
 def main():
     ap = argparse.ArgumentParser(description="Выпуск версии Osnastka")
     ap.add_argument("version", help="номер версии, например 0.2.0")
@@ -56,16 +66,21 @@ def main():
     with open(INIT, "w", encoding="utf-8") as f:
         f.write(re.sub(r'__version__ = "[^"]*"', f'__version__ = "{a.version}"', text))
 
-    # сборка и архив
+    # сборка и архив (обычная — Windows 10/11)
     run(sys.executable, "-m", "PyInstaller", "--noconfirm", "--log-level", "WARN", "Osnastka.spec")
-    zip_path = os.path.join(DIST, f"Osnastka-{a.version}.zip")
-    app_dir = os.path.join(DIST, "Osnastka")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-        for root, _, files in os.walk(app_dir):
-            for name in files:
-                full = os.path.join(root, name)
-                z.write(full, os.path.join("Osnastka", os.path.relpath(full, app_dir)))
-    print("Архив:", zip_path, f"{os.path.getsize(zip_path) / 2**20:.0f} МБ")
+    zip_path = make_zip(os.path.join(DIST, "Osnastka"), os.path.join(DIST, f"Osnastka-{a.version}.zip"))
+    zips = [zip_path]
+    # сборка для Windows 7 (Python 3.8 + Qt 5) — если есть окружение .venv38
+    py38 = os.path.join(ROOT, ".venv38", "Scripts", "python.exe")
+    win7_zip = None
+    if os.path.exists(py38):
+        dist7 = os.path.join(ROOT, "dist_win7")
+        run(py38, "-m", "PyInstaller", "--noconfirm", "--log-level", "WARN", "--distpath", dist7,
+            "--workpath", os.path.join(ROOT, "build", "work38"), "Osnastka.spec")
+        win7_zip = make_zip(os.path.join(dist7, "Osnastka"), os.path.join(DIST, f"Osnastka-win7-{a.version}.zip"))
+        zips.append(win7_zip)
+    else:
+        print("! Нет .venv38 — сборка для Windows 7 пропущена")
 
     # коммит и тег
     run("git", "commit", "-q", "-am", f"Версия {a.version}" + (f"\n\n{a.notes}" if a.notes else ""))
@@ -73,16 +88,19 @@ def main():
 
     if a.folder:
         os.makedirs(a.folder, exist_ok=True)
-        shutil.copy2(zip_path, a.folder)
+        for z in zips:
+            shutil.copy2(z, a.folder)
+        info = {"version": a.version, "file": os.path.basename(zip_path), "notes": a.notes}
+        if win7_zip:
+            info["file_win7"] = os.path.basename(win7_zip)
         with open(os.path.join(a.folder, "latest.json"), "w", encoding="utf-8") as f:
-            json.dump({"version": a.version, "file": os.path.basename(zip_path), "notes": a.notes},
-                      f, ensure_ascii=False, indent=1)
+            json.dump(info, f, ensure_ascii=False, indent=1)
         if run("git", "remote", capture=True).stdout.strip():
             run("git", "push", "--follow-tags", check=False)
         print(f"Готово: версия {a.version} выложена в {a.folder}")
     else:
         run("git", "push", "--follow-tags")
-        run("gh", "release", "create", tag, zip_path, "--title", f"Osnastka {a.version}",
+        run("gh", "release", "create", tag, *zips, "--title", f"Osnastka {a.version}",
             "--notes", a.notes or f"Версия {a.version}")
         print(f"Готово: релиз {tag} опубликован на GitHub")
 

@@ -1,7 +1,7 @@
 """Оформление: фирменная гамма (красный, графит, белый) и стиль элементов интерфейса."""
 from __future__ import annotations
 
-from PySide6.QtGui import QColor, QFont, QPalette
+from qtpy.QtGui import QColor, QFont, QPalette
 
 RED = "#D7262D"          # фирменный красный
 RED_DARK = "#B01E24"
@@ -120,6 +120,11 @@ QScrollBar::handle:hover {{ background: #A8ADB4; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: none; }}
 """
+
+
+def popup(menu, pos):
+    """Показать меню: QMenu.exec в Qt 6 (PySide6), QMenu.exec_ в Qt 5 (PySide2, сборка для Windows 7)."""
+    return (getattr(menu, "exec", None) or menu.exec_)(pos)
 
 
 def apply(app):

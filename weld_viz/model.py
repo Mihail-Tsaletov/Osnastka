@@ -39,7 +39,8 @@ class Node:
     mesh: str | None
     parent: "Node | None" = None
     children: list["Node"] = field(default_factory=list)
-    color: int | None = None      # цвет тела в NX (для «шоп»-деталей)
+    color: int | None = None      # цвет в NX, как он виден в сборке (с учётом переопределения)
+    part_color: int | None = None # цвет тела в файле детали (для выбора тел по цвету)
     is_group: bool = False        # группа тел, созданная пользователем
     is_body: bool = False         # отдельное тело многотельной детали
     replaced_by: str | None = None  # узел заменён деталью из этого файла (replace.py)
@@ -89,7 +90,8 @@ class AssemblyModel:
         if re.fullmatch(r"\d{1,4}", designation.strip()) and d["part"]:
             designation = d["part"]   # в атрибуте номер позиции, а не обозначение — берём имя файла
         n = Node(d["id"], d["key"], d["name"], d["part"], designation, d.get("title", ""), mesh, parent,
-                 color=d.get("color"), is_body=bool(d.get("body")))
+                 color=d.get("color"), is_body=bool(d.get("body")),
+                 part_color=d.get("part_color", d.get("color")))
         n.children = [self._build(c, n) for c in d["children"]]
         return n
 
@@ -167,7 +169,7 @@ class AssemblyModel:
                 if not fresh:
                     pv.read(rn.mesh).transform(matrix, inplace=False).save(mesh)
             n = Node("r" + rn.id + "_" + node.id, key + "/" + rel, rn.name, rn.part, rn.designation, rn.title, mesh,
-                     parent, color=rn.color, is_body=rn.is_body)
+                     parent, color=rn.color, is_body=rn.is_body, part_color=rn.part_color)
             n.children = [graft(c, n) for c in rn.children]
             self._orig_nodes[n.key] = n
             self._orig_children[n.key] = list(n.children)

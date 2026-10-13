@@ -1,0 +1,12 @@
+# Сборка для Windows 7: Python 3.8 (последний с поддержкой Win7) + Qt 5.15 + VTK 9.2
+PySide2==5.15.2.1
+vtk==9.2.6
+pyvista<0.45
+pyvistaqt
+qtpy
+numpy<1.25
+matplotlib<3.8
+reportlab
+PyYAML
+Pillow
+pyinstaller==6.22.3
