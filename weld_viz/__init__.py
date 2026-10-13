@@ -1,4 +1,4 @@
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # Qt: PySide6 (Windows 10/11) или PySide2 (сборка для Windows 7); модули импортируют Qt через qtpy
 import importlib.util as _ilu  # noqa: E402
