@@ -53,6 +53,46 @@ def find_for_model(source: str) -> list[tuple[str, bool]]:
     return found
 
 
+DETAIL_LETTERS = "АБВГДЕЖИКЛМНПРСТУФ"
+
+
+@dataclass
+class Detail:
+    """Уточнение на листе этапа: тот же этап другим (обычно крупным) видом, в окошке поверх общего вида."""
+    camera: dict                                    # ракурс уточнения, как у этапа
+    rect: list[float] = field(default_factory=lambda: [0.64, 0.58, 0.34, 0.40])   # x, y, ш, в — доли картинки этапа, от левого верхнего угла
+    title: str = ""                                 # подпись: «Вид А: <title>»
+    mark: bool = True                               # обвести место уточнения на общем виде
+    # обводка, сдвинутая вручную: смещение центра (dx, dy) и множитель радиуса k — в радиусах обводки по виду
+    mark_adj: list[float] = field(default_factory=lambda: [0.0, 0.0, 1.0])
+
+    def to_dict(self) -> dict:
+        d = {"camera": self.camera, "rect": [round(float(v), 4) for v in self.rect], "mark": self.mark}
+        if [round(float(v), 4) for v in self.mark_adj] != [0.0, 0.0, 1.0]:
+            d["mark_adj"] = [round(float(v), 4) for v in self.mark_adj]
+        if self.title:
+            d["title"] = self.title
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Detail":
+        adj = d.get("mark_adj") or [0.0, 0.0, 1.0]
+        return cls(camera=d.get("camera") or {}, rect=clamp_rect(d.get("rect") or [0.64, 0.58, 0.34, 0.40]),
+                   title=d.get("title", ""), mark=bool(d.get("mark", True)),
+                   mark_adj=[float(v) for v in adj][:3] if len(adj) >= 3 else [0.0, 0.0, 1.0])
+
+
+def clamp_rect(rect) -> list[float]:
+    """Окошко целиком внутри картинки этапа, не меньше 12 % по каждой стороне."""
+    x, y, w, h = (float(v) for v in rect)
+    w, h = min(max(w, 0.12), 1.0), min(max(h, 0.12), 1.0)
+    return [min(max(x, 0.0), 1.0 - w), min(max(y, 0.0), 1.0 - h), w, h]
+
+
+def detail_letter(i: int) -> str:
+    return DETAIL_LETTERS[i] if i < len(DETAIL_LETTERS) else str(i + 1)
+
+
 @dataclass
 class Step:
     name: str = ""
@@ -61,6 +101,10 @@ class Step:
     hide: list[str] = field(default_factory=list)   # ранее заложенные детали, скрытые на этом этапе
     direction: str = "-Z"                           # направление закладки (стрелки)
     camera: dict | None = None                      # {position, focal_point, view_up}
+    details: list[Detail] = field(default_factory=list)   # уточнения на листе этапа
+    # стрелки, сдвинутые вручную: ключ детали/прижима -> {"anchor": [dx, dy, dz], "free": [dx, dy, dz]} (мм);
+    # anchor — сдвиг всей стрелки (конец у детали), free — дополнительно свободного конца с подписью
+    arrows: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -99,6 +143,9 @@ class Scenario:
                     "hide": list(s.hide) or None,
                     "direction": s.direction,
                     "camera": s.camera,
+                    "details": [d.to_dict() for d in s.details] or None,
+                    "arrows": {k: {e: [round(float(x), 2) for x in v] for e, v in a.items()}
+                               for k, a in s.arrows.items()} or None,
                 }.items() if v is not None}
                 for s in self.steps
             ],
@@ -106,6 +153,8 @@ class Scenario:
 
     @staticmethod
     def _rel(file: str, base_dir: str | None) -> str:
+        if file.startswith("tc:"):
+            return file
         if base_dir and file:
             try:
                 file = os.path.relpath(file, base_dir)
@@ -115,7 +164,7 @@ class Scenario:
 
     @staticmethod
     def _abs(file: str, scenario_path: str) -> str:
-        if file and not os.path.isabs(file):
+        if file and not os.path.isabs(file) and not file.startswith("tc:"):
             file = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(scenario_path)), file))
         return file
 
@@ -142,7 +191,11 @@ class Scenario:
                           for k, v in (d.get("replacements") or {}).items()},
             steps=[Step(name=s.get("name", ""), add=list(s.get("add") or []), show=list(s.get("show") or []),
                         hide=list(s.get("hide") or []),
-                        direction=s.get("direction", "-Z"), camera=s.get("camera"))
+                        direction=s.get("direction", "-Z"), camera=s.get("camera"),
+                        details=[Detail.from_dict(d) for d in s.get("details") or [] if d.get("camera")],
+                        arrows={k: {e: [float(x) for x in v][:3] for e, v in (a or {}).items()
+                                    if e in ("anchor", "free") and len(v) >= 3}
+                                for k, a in (s.get("arrows") or {}).items()})
                    for s in d.get("steps") or []],
         )
 

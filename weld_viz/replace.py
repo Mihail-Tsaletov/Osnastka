@@ -11,7 +11,7 @@ import os
 import numpy as np
 import pyvista as pv
 
-from . import nx_bridge
+from . import nx_bridge, nx_link
 from .align import AlignResult, register
 from .model import AssemblyModel
 from .scenario import Scenario
@@ -38,10 +38,15 @@ def apply_all(model: AssemblyModel, scenario: Scenario, export=None) -> list[str
         if key not in model.by_key and key not in model.original_keys():
             warnings.append(f"Замена «{os.path.basename(file)}»: узла {key} нет в сборке — пропущена")
             continue
-        if not os.path.exists(file):
+        tc = nx_link.is_tc(file)
+        if not tc and not os.path.exists(file):
             warnings.append(f"Файл замены не найден: {file}")
             continue
         if not nx_bridge.is_export_fresh(file):
+            if tc:
+                warnings.append(f"Деталь замены {nx_link.model_title(file)} не выгружена — откройте её в NX и "
+                                f"нажмите кнопку Osnastka")
+                continue
             if export is None:
                 warnings.append(f"Файл замены не выгружен из NX: {file}")
                 continue

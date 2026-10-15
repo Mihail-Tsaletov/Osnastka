@@ -1,18 +1,32 @@
 """PDF-инструкция по закладке: по странице A4 (альбом) на этап."""
 from __future__ import annotations
 
+import hashlib
 import os
+import sys
 from datetime import date
 
-from PIL import Image
-from reportlab.lib.pagesizes import A4, landscape
+if sys.version_info < (3, 9) and not getattr(hashlib.md5, "_osnastka_compat", False):
+    # reportlab 4.1+ вызывает md5(usedforsecurity=False) — параметр появился в Python 3.9;
+    # сборка для Windows 7 работает на Python 3.8 (до импорта reportlab)
+    _md5 = hashlib.md5
+
+    def _md5_compat(*args, usedforsecurity=True, **kwargs):
+        return _md5(*args, **kwargs)
+
+    _md5_compat._osnastka_compat = True
+    hashlib.md5 = _md5_compat
+
+from PIL import Image  # noqa: E402
+from reportlab.lib.pagesizes import A4, landscape  # noqa: E402
 from reportlab.lib.utils import ImageReader, simpleSplit
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
+from . import details as lay
 from .model import Classifier, Node
-from .scenario import DIRECTIONS, Scenario
+from .scenario import DIRECTIONS, Scenario, detail_letter
 from .scene import (COLOR_FIXTURE, COLOR_MOVABLE, COLOR_PART_DONE, COLOR_PART_NEW, COLOR_REMOVED,
                     SceneBuilder)
 
@@ -37,12 +51,78 @@ def _node_line(n: Node) -> str:
     return n.label
 
 
+def draw_step_image(c, scenario: Scenario, cls: Classifier, scene: SceneBuilder, i: int,
+                    x0: float, y0: float, img_w: float, img_h: float):
+    """Общий вид этапа в прямоугольнике (x0, y0 — левый нижний угол) и окошки уточнений поверх него."""
+    step = scenario.steps[i]
+    k = lay.RENDER_SCALE
+    scale = max(1.0, img_w * k / 1000)
+    img, marks = scene.render_step(scenario, cls, i, (img_w * k, img_h * k),
+                                   marks=[d.camera for d in step.details], scale=scale)
+    c.drawImage(ImageReader(Image.fromarray(img)), x0, y0, width=img_w, height=img_h,
+                preserveAspectRatio=True, anchor="c")
+    c.setStrokeColorRGB(0.8, 0.8, 0.8)
+    c.setLineWidth(1)
+    c.rect(x0, y0, img_w, img_h)
+
+    def pt(fx, fy):   # доли картинки (y сверху) -> координаты листа
+        return x0 + fx * img_w, y0 + (1 - fy) * img_h
+
+    aspect = img_w / img_h
+    marks = [lay.place_mark(m, d, aspect) for d, m in zip(step.details, marks)]
+    # обводки мест и выносные линии — под окошками
+    for j, (d, m) in enumerate(zip(step.details, marks)):
+        if not m:
+            continue
+        cx, cy = pt(m[0], m[1])
+        r = m[2] * img_h
+        c.setStrokeColor(lay.CALLOUT)
+        c.setLineWidth(1.4)
+        c.circle(cx, cy, r, stroke=1, fill=0)
+        ln = lay.leader(m, d.rect, aspect)
+        if ln:
+            c.setLineWidth(0.8)
+            c.setDash(3, 2)
+            c.line(*pt(*ln[0]), *pt(*ln[1]))
+            c.setDash()
+        bx, by = pt(*lay.badge_pos(m, [o.rect for o in step.details], aspect))   # буква вида на обводке
+        c.setFillColor(lay.CALLOUT)
+        c.circle(bx, by, 6.5, stroke=0, fill=1)
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont(FONT_BOLD, 8.5)
+        c.drawCentredString(bx, by - 3, detail_letter(j))
+    for j, d in enumerate(step.details):
+        rx, ry_top = pt(d.rect[0], d.rect[1])
+        rw, rh = d.rect[2] * img_w, d.rect[3] * img_h
+        ry = ry_top - rh
+        sub, _ = scene.render_step(scenario, cls, i, (rw * k, rh * k), camera=d.camera, scale=scale)
+        c.setFillColorRGB(1, 1, 1)
+        c.rect(rx, ry, rw, rh, stroke=0, fill=1)
+        c.drawImage(ImageReader(Image.fromarray(sub)), rx, ry, width=rw, height=rh)
+        c.setStrokeColor(INK)
+        c.setLineWidth(1)
+        c.rect(rx, ry, rw, rh, stroke=1, fill=0)
+        text = lay.detail_label(j, d)
+        lines = simpleSplit(text, FONT_BOLD, 8.5, rw - 10)[:2]
+        tab_w = min(rw, max(c.stringWidth(t, FONT_BOLD, 8.5) for t in lines) + 10)
+        tab_h = 4 + 10 * len(lines)
+        c.setFillColor(lay.CALLOUT)
+        c.rect(rx, ry_top - tab_h, tab_w, tab_h, stroke=0, fill=1)
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont(FONT_BOLD, 8.5)
+        for n, t in enumerate(lines):
+            c.drawString(rx + 5, ry_top - 11 - 10 * n, t)
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setFillColorRGB(0, 0, 0)
+    c.setLineWidth(1)
+
+
 def export_pdf(path: str, scenario: Scenario, cls: Classifier, scene: SceneBuilder, title: str,
                progress=None):
     _register_fonts()
     W, H = landscape(A4)
-    M = 28
-    side_w = 240
+    M = lay.MARGIN
+    side_w = lay.SIDE_W
     c = canvas.Canvas(path, pagesize=(W, H))
     c.setTitle(title)
     total = len(scenario.steps)
@@ -69,15 +149,9 @@ def export_pdf(path: str, scenario: Scenario, cls: Classifier, scene: SceneBuild
         c.line(M, H - M - 22, W - M, H - M - 22)
         c.setStrokeColorRGB(0, 0, 0)
 
-        # картинка
-        img_w = W - 2 * M - side_w - 14
-        img_h = H - 2 * M - 40
-        img = scene.screenshot(scenario, cls, i, size=(int(img_w * 3), int(img_h * 3)))
-        c.drawImage(ImageReader(Image.fromarray(img)), M, M + 6, width=img_w, height=img_h,
-                    preserveAspectRatio=True, anchor="c")
-        c.setStrokeColorRGB(0.8, 0.8, 0.8)
-        c.rect(M, M + 6, img_w, img_h)
-        c.setStrokeColorRGB(0, 0, 0)
+        # картинка: общий вид этапа + окошки уточнений
+        img_w, img_h = lay.IMG_W, lay.IMG_H
+        draw_step_image(c, scenario, cls, scene, i, M, M + 6, img_w, img_h)
 
         # правая колонка
         x = W - M - side_w

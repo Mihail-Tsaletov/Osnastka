@@ -19,7 +19,8 @@ from . import __version__, nx_bridge, nx_link, paths, replace, theme, updater
 from .model import (FIXTURE, GROUP_PREFIX, HIDDEN, MOVABLE, PART, ROLE_TITLES, AssemblyModel, Classifier, Node,
                     prefix_of)
 from .pdf_report import export_pdf
-from .scenario import DIRECTIONS, Scenario, Step, find_for_model
+from . import details as lay
+from .scenario import DIRECTIONS, Detail, Scenario, Step, detail_letter, find_for_model
 from .scene import COLOR_FIXTURE, COLOR_MOVABLE, COLOR_PART_NEW, SceneBuilder
 
 APP_TITLE = "Закладка в оснастку"
@@ -99,6 +100,9 @@ class MainWindow(QMainWindow):
         self._wheel_filter_global = NoWheelUnlessFocused(self)
 
         self._pending_update = None
+        self._await_replace = None
+        self._editing_detail = None   # (этап, № уточнения, новое) — вид уточнения настраивается в 3D
+        self._detail_back = None
         self._upd = UpdateSignals(self)
         self._upd.result.connect(self._on_update_result)
         self._upd.error.connect(self._on_update_error)
@@ -254,6 +258,35 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.camera_mark)
         sv.addLayout(row2)
 
+        row3 = QHBoxLayout()
+        row3.setSpacing(6)
+        row3.addWidget(label("Уточнения на листе", "fieldLabel"))
+        self.details_box = QHBoxLayout()
+        self.details_box.setSpacing(6)
+        row3.addLayout(self.details_box)
+        self.btn_add_detail = QPushButton("+  Уточнение")
+        self.btn_add_detail.setToolTip(
+            "Окошко с крупным видом на листе этапа. Выделите элемент в дереве или таблице — вид наведётся на него; "
+            "без выделения — настройте вид в 3D сами и нажмите «Готово»")
+        self.btn_add_detail.clicked.connect(self.add_detail)
+        self.btn_layout = QPushButton("Компоновка листа…")
+        self.btn_layout.setToolTip("Лист этапа как в PDF: перетащите окошки уточнений, обводки и стрелки деталей "
+                                   "и прижимов")
+        self.btn_layout.clicked.connect(lambda: self.open_layout())
+        self.detail_edit_label = label("", "chip")
+        self.btn_detail_ok = QPushButton("Готово")
+        self.btn_detail_ok.setObjectName("primary")
+        self.btn_detail_ok.clicked.connect(lambda: self._finish_detail_edit(True, layout=True))
+        self.btn_detail_cancel = QPushButton("Отмена")
+        self.btn_detail_cancel.clicked.connect(lambda: self._finish_detail_edit(False))
+        for w in (self.btn_add_detail, self.btn_layout, self.detail_edit_label, self.btn_detail_ok,
+                  self.btn_detail_cancel):
+            if isinstance(w, QPushButton):
+                w.setCursor(Qt.PointingHandCursor)
+            row3.addWidget(w)
+        row3.addStretch()
+        sv.addLayout(row3)
+
         self.table = QTableWidget()
         # без выделения и клавиатуры: этап меняется только щелчком или кнопками
         self.table.setSelectionMode(QAbstractItemView.NoSelection)
@@ -294,6 +327,13 @@ class MainWindow(QMainWindow):
         self.update_btn.clicked.connect(self.install_update)
         self.update_btn.hide()
         self.statusBar().addPermanentWidget(self.update_btn)
+        self.await_label = label("", "chip")
+        self.await_cancel = QPushButton("Отменить ожидание")
+        self.await_cancel.clicked.connect(lambda: self._set_await_replace(None))
+        self.statusBar().addPermanentWidget(self.await_label)
+        self.statusBar().addPermanentWidget(self.await_cancel)
+        self.await_label.hide()
+        self.await_cancel.hide()
         self.statusBar().addPermanentWidget(label(f"версия {__version__}", "hint"))
         self.statusBar().showMessage("Откройте сборку NX (.prt) или сценарий (.yaml)")
 
@@ -305,6 +345,8 @@ class MainWindow(QMainWindow):
         self.refresh_view()
 
     def _show_all_toggled(self, on):
+        self._finish_detail_edit(True)
+        self._update_details_bar()
         if on:
             self._remember_view()
         self.refresh_view(reset_camera=True)
@@ -391,13 +433,16 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, self.take_nx_request)   # запрос, пришедший до запуска программы
 
     def take_nx_request(self):
+        if not self.isVisible():   # закрытое окно запросы не забирает
+            return
         req = nx_link.take_request()
         if not req:
             return
         self.raise_()
         self.activateWindow()
         source = req.get("source", "")
-        if not self._confirm_discard():
+        awaiting = self._await_replace if self.model and self._await_replace in self.model.by_key else None
+        if not awaiting and not self._confirm_discard():
             return
         # выгрузка из сеанса NX лежит во временной папке — перенести в кэш программы
         src_dir, dst_dir = req.get("export_dir", ""), nx_bridge.export_dir_for(source)
@@ -405,16 +450,45 @@ class MainWindow(QMainWindow):
             shutil.rmtree(dst_dir, ignore_errors=True)
             os.makedirs(os.path.dirname(dst_dir), exist_ok=True)
             shutil.move(src_dir, dst_dir)
+        if awaiting:   # ждали деталь из NX для замены шоп-детали
+            self._set_await_replace(None)
+            self._replace_finish(awaiting, source)
+            return
         self._open_model(source, intro=f"Из NX пришла модель «{nx_link.model_title(source)}».\n\n")
 
+    def _set_await_replace(self, key):
+        """Ожидание детали из открытого NX для замены узла key (None — отменить)."""
+        self._await_replace = key
+        if key:
+            node = self.model.by_key[key]
+            self.await_label.setText(f"Ждём из NX деталь для замены «{node.short_label}» — откройте её в NX и "
+                                     f"нажмите кнопку Osnastka")
+            self.await_label.show()
+            self.await_cancel.show()
+        else:
+            self.await_label.hide()
+            self.await_cancel.hide()
+
+    def _replace_from_nx(self, node):
+        self._set_await_replace(node.key)
+        QMessageBox.information(
+            self, APP_TITLE,
+            f"Откройте в NX нормальную сборку (или деталь) для «{node.short_label}» — с диска или из Teamcenter — "
+            f"и нажмите кнопку Osnastka (Alt+F8 → журнал osnastka_nx.cs → «Выполнить»).\n\n"
+            f"Программа совместит её с «{node.short_label}» по геометрии и подставит вместо неё. "
+            f"Пока ждём — внизу окна надпись; отменить — кнопкой рядом с ней.")
+
     def show_nx_button_help(self):
-        QApplication.clipboard().setText(nx_link.JOURNAL)
+        QApplication.clipboard().setText(nx_link.BUTTON_JOURNAL)
         QMessageBox.information(
             self, APP_TITLE,
             "Модель можно передать прямо из открытого NX — и из обычного, и из NX с Teamcenter "
             "(режим определяется сам, сохранять модель локально не нужно).\n\n"
-            "Журнал для кнопки (C#, лежит в папке программы; путь уже скопирован в буфер обмена):\n"
-            f"{nx_link.JOURNAL}\n\n"
+            "Журнал для кнопки (C#; путь уже скопирован в буфер обмена):\n"
+            f"{nx_link.BUTTON_JOURNAL}\n"
+            "Это копия журнала из папки программы, которая обновляется при каждом запуске программы, — "
+            "поэтому кнопку в NX настраивать на неё (а не на папку программы): так после обновлений "
+            "программы NX сразу работает с новым журналом.\n\n"
             "Быстрый способ: в NX нажмите Alt+F8 («Воспроизвести журнал»; или вкладка «Разработка» → "
             "«Журнал» → «Воспроизвести»), нажмите «Обзор», выберите этот файл и «Выполнить». "
             "NX запоминает последний журнал — в следующий раз только Alt+F8 → «Выполнить».\n\n"
@@ -464,86 +538,183 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ обновления
     def check_updates(self, manual=False):
+        """manual — кнопка «Обновления» (окно обновлений); иначе тихая проверка при запуске."""
+        if manual:
+            self.show_update_dialog()
+            return
+
         def work():
             try:
                 if updater.is_git_checkout():
-                    self._upd.result.emit(("git", updater.git_check()), manual)
+                    self._upd.result.emit(("git", updater.git_check()), False)
                 else:
-                    self._upd.result.emit(("release", updater.check()), manual)
-            except Exception as e:  # сеть недоступна и т.п.
-                self._upd.error.emit(str(e), manual)
+                    self._upd.result.emit(("package", updater.check()), False)
+            except Exception as e:
+                self._upd.error.emit(str(e), False)
 
-        if manual:
-            self.statusBar().showMessage("Проверка обновлений…", 3000)
         threading.Thread(target=work, daemon=True).start()
 
     def _on_update_result(self, res, manual):
         kind, val = res
-        if kind == "git" and val > 0:
+        if (kind == "git" and val > 0) or (kind == "package" and val is not None):
             self._pending_update = res
-            self.update_btn.setText(f"Есть обновление ({val} изм.) — обновить")
+            self.update_btn.setText(f"Есть обновление ({val} изм.)" if kind == "git"
+                                    else f"Доступно обновление {val.version} — установить")
             self.update_btn.show()
-        elif kind == "release" and val is not None:
-            self._pending_update = res
-            self.update_btn.setText(f"Доступна версия {val.version} — обновить")
-            self.update_btn.show()
-        elif manual:
-            text = f"Установлена последняя версия {__version__}."
-            if kind == "git" and val < 0:
-                text = "У папки программы нет связанного удалённого репозитория (git remote) — обновлять неоткуда."
-            QMessageBox.information(self, APP_TITLE, text + f"\n\nИсточник обновлений: {updater.source_title()}")
-            return
-        if manual and self._pending_update:
-            self.install_update()
 
     def _on_update_error(self, msg, manual):
-        if manual:
-            QMessageBox.warning(self, APP_TITLE, f"Не удалось проверить обновления:\n{msg}\n\n"
-                                                 f"Источник: {updater.source_title()}")
+        pass   # тихая проверка: нет сети / нет папки — не мешаем работе
 
     def install_update(self):
-        if not self._pending_update:
-            return
-        kind, val = self._pending_update
-        if kind == "git":
-            if QMessageBox.question(self, APP_TITLE, f"На сервере {val} новых изменений. Загрузить (git pull)?") \
-                    != QMessageBox.Yes:
+        self.show_update_dialog()
+
+    def show_update_dialog(self):
+        from qtpy.QtWidgets import QDialog
+        if updater.is_git_checkout():
+            n = updater.git_check()
+            if n <= 0:
+                QMessageBox.information(self, APP_TITLE, f"Версия {__version__} (из исходников, git): обновлений нет.")
                 return
-            try:
-                out = updater.git_pull()
-            except Exception as e:
-                QMessageBox.critical(self, APP_TITLE, f"git pull не удался:\n{e}")
-                return
-            self.update_btn.hide()
-            self._pending_update = None
-            QMessageBox.information(self, APP_TITLE, f"Обновлено:\n{out}\n\nПерезапустите программу.")
+            if QMessageBox.question(self, APP_TITLE, f"На сервере {n} новых изменений. Загрузить (git pull)?") \
+                    == QMessageBox.Yes:
+                try:
+                    out = updater.git_pull()
+                    QMessageBox.information(self, APP_TITLE, f"Обновлено:\n{out}\n\nПерезапустите программу.")
+                except Exception as e:
+                    QMessageBox.critical(self, APP_TITLE, f"git pull не удался:\n{e}")
             return
 
-        notes = f"\n\nЧто нового:\n{val.notes}" if val.notes else ""
-        if QMessageBox.question(self, APP_TITLE, f"Установить версию {val.version} (сейчас {__version__})?\n"
-                                                 f"Программа закроется и запустится заново.{notes}") \
-                != QMessageBox.Yes:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Обновления — " + APP_TITLE)
+        dlg.setMinimumWidth(620)
+        lay = QVBoxLayout(dlg)
+        built_version, _ = updater.build_info()
+        where = "обновление, установленное из архива" if updater.running_from_update() else "встроенная в программу"
+        lay.addWidget(label(f"Работает версия <b>{__version__}</b> ({where}). Установленная программа — "
+                            f"{built_version}.", None))
+        hint = label("Чтобы обновить программу без прав администратора, положите архив "
+                     "<b>Osnastka-update-&lt;версия&gt;.zip</b> в папку обновлений и нажмите «Установить». "
+                     "Программа перезапустится сама, другие программы не запускаются.", "hint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        folder_row = QHBoxLayout()
+        folder_label = label("", "chipMuted")
+        folder_label.setWordWrap(True)
+        folder_row.addWidget(folder_label, 1)
+        b_change = QPushButton("Изменить папку…")
+        b_open = QPushButton("Открыть папку")
+        folder_row.addWidget(b_change)
+        folder_row.addWidget(b_open)
+        lay.addLayout(folder_row)
+        found_label = label("", None)
+        found_label.setWordWrap(True)
+        lay.addWidget(found_label)
+
+        buttons = QHBoxLayout()
+        b_install = QPushButton("Установить")
+        b_install.setObjectName("primary")
+        b_file = QPushButton("Выбрать файл обновления…")
+        b_github = QPushButton("Проверить GitHub")
+        b_revert = QPushButton("Вернуть встроенную версию")
+        b_close = QPushButton("Закрыть")
+        for b in (b_install, b_file, b_github, b_revert):
+            buttons.addWidget(b)
+        buttons.addStretch()
+        buttons.addWidget(b_close)
+        lay.addLayout(buttons)
+        state = {"pkg": None}
+
+        def refresh():
+            folder = updater.update_folder()
+            folder_label.setText(f"Папка обновлений: {folder}")
+            current = updater.parse_version(__version__)
+            pkgs = updater.folder_packages(folder)
+            newer = [p for p in pkgs if updater.parse_version(p.version) > current]
+            state["pkg"] = newer[0] if newer else None
+            if newer:
+                p = newer[0]
+                found_label.setText(f"Найдено обновление <b>{p.version}</b>: {os.path.basename(p.path)}"
+                                    + (f"<br>{p.notes}" if p.notes else ""))
+            elif pkgs:
+                found_label.setText(f"В папке есть архивы, но не новее работающей версии (последний — {pkgs[0].version}).")
+            else:
+                found_label.setText("В папке обновлений нет архивов Osnastka-update-…zip.")
+            b_install.setEnabled(state["pkg"] is not None)
+            b_revert.setEnabled(os.path.exists(updater.CURRENT))
+
+        def change_folder():
+            d = QFileDialog.getExistingDirectory(dlg, "Папка с обновлениями", updater.update_folder())
+            if d:
+                updater.set_update_folder(d)
+                refresh()
+
+        def choose_file():
+            path, _ = QFileDialog.getOpenFileName(dlg, "Архив обновления", updater.update_folder(),
+                                                  "Обновление программы (Osnastka-update-*.zip);;Архивы (*.zip)")
+            if path:
+                self._install_package(path, dlg)
+
+        def github():
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                p = updater.github_package()
+            except Exception as e:
+                p, err = None, str(e)
+            else:
+                err = ""
+            finally:
+                QApplication.restoreOverrideCursor()
+            if p and updater.parse_version(p.version) > updater.parse_version(__version__):
+                if QMessageBox.question(dlg, APP_TITLE, f"На GitHub есть версия {p.version}. Скачать и установить?") \
+                        == QMessageBox.Yes:
+                    try:
+                        self._install_package(updater.download(p), dlg)
+                    except Exception as e:
+                        QMessageBox.critical(dlg, APP_TITLE, f"Не удалось скачать обновление:\n{e}")
+            else:
+                QMessageBox.information(dlg, APP_TITLE, "GitHub недоступен (нет доступа в интернет?)." if err
+                                        else "На GitHub нет версии новее работающей.")
+
+        def revert():
+            if QMessageBox.question(dlg, APP_TITLE, f"Отключить установленные обновления и вернуться к версии "
+                                                    f"{built_version}, встроенной в программу?") == QMessageBox.Yes:
+                updater.revert_to_builtin()
+                self._offer_restart(dlg, f"Со следующего запуска будет работать версия {built_version}.")
+
+        b_change.clicked.connect(change_folder)
+        b_open.clicked.connect(lambda: os.startfile(updater.update_folder()))
+        b_install.clicked.connect(lambda: state["pkg"] and self._install_package(state["pkg"].path, dlg))
+        b_file.clicked.connect(choose_file)
+        b_github.clicked.connect(github)
+        b_revert.clicked.connect(revert)
+        b_close.clicked.connect(dlg.reject)
+        refresh()
+        (getattr(dlg, "exec", None) or dlg.exec_)()
+
+    def _install_package(self, zip_path, parent):
+        if not updater.FROZEN:
+            QMessageBox.information(parent, APP_TITLE, "Программа запущена из исходников — обновление архивом "
+                                                       "работает только в установленной программе (Osnastka.exe).")
+            return
+        try:
+            pkg = updater.install(zip_path)
+        except Exception as e:
+            QMessageBox.critical(parent, APP_TITLE, f"Обновление не установлено:\n{e}")
+            return
+        self.update_btn.hide()
+        self._pending_update = None
+        self._offer_restart(parent, f"Обновление {pkg.version} установлено.")
+
+    def _offer_restart(self, parent, text):
+        if QMessageBox.question(parent, APP_TITLE, text + "\n\nПерезапустить программу сейчас?") != QMessageBox.Yes:
             return
         if not self._confirm_discard():
             return
-        dlg = QProgressDialog("Загрузка обновления…", None, 0, 100, self)
-        dlg.setWindowTitle(APP_TITLE)
-        dlg.setWindowModality(Qt.WindowModal)
-        dlg.show()
-
-        def progress(done, total):
-            dlg.setValue(int(done * 100 / total) if total else 0)
-            QApplication.processEvents()
-
-        try:
-            zip_path = updater.download(val, progress)
-            updater.start_install(zip_path)
-        except Exception as e:
-            dlg.close()
-            QMessageBox.critical(self, APP_TITLE, f"Не удалось установить обновление:\n{e}")
-            return
-        dlg.close()
+        cmd = updater.restart_command()
+        QProcess.startDetached(cmd[0], cmd[1:])
         self.dirty = False
+        parent.close()
         self.close()
         QApplication.quit()
 
@@ -603,6 +774,8 @@ class MainWindow(QMainWindow):
             self.run_nx_export(path=stale[0], on_done=self._on_export_ready)
             return
         try:
+            self._set_await_replace(None)   # ожидание детали из NX относилось к прежней модели
+            self._editing_detail = None
             self.model = AssemblyModel(nx_bridge.export_dir_for(self.prt_path))
         except Exception as e:
             QMessageBox.critical(self, APP_TITLE, f"Не удалось прочитать результат экспорта:\n{e}")
@@ -781,6 +954,8 @@ class MainWindow(QMainWindow):
             elif self.model.original_leaves(node.key) or node.mesh:
                 menu.addAction("Заменить деталью из файла… (узел с деревом деталей)").triggered.connect(
                     lambda: self._replace_start(node))
+                menu.addAction("Заменить деталью из открытого NX…").triggered.connect(
+                    lambda: self._replace_from_nx(node))
             menu.addSeparator()
 
         groupable = [n for n in movable_nodes if not n.is_group]
@@ -969,7 +1144,7 @@ class MainWindow(QMainWindow):
             res = replace.align(self.model, key, repl)
         finally:
             QApplication.restoreOverrideCursor()
-        name = os.path.basename(path)
+        name = nx_link.model_title(path)
         if res.matched == 0:
             QMessageBox.critical(self, APP_TITLE,
                                  f"Не удалось совместить «{name}» с «{node.short_label}»: ни одна деталь файла не "
@@ -1379,6 +1554,7 @@ class MainWindow(QMainWindow):
             return
         changed = idx != self.current_step
         if changed:
+            self._finish_detail_edit(True)
             self._remember_view()
         self.current_step = idx
         s = self.scenario.steps[idx]
@@ -1389,6 +1565,7 @@ class MainWindow(QMainWindow):
         self._updating = False
         self._update_camera_mark()
         self._sync_table()
+        self._update_details_bar()
         self.refresh_view(reset_camera=changed)
 
     def go_step(self, delta):
@@ -1471,6 +1648,8 @@ class MainWindow(QMainWindow):
         """Если вид текущего этапа повернули — сохранить его за этапом."""
         if self.current_step is None or self._entry_camera is None or self.show_all.isChecked():
             return
+        if self._editing_detail is not None:
+            return   # в 3D сейчас вид уточнения
         if self._render_timer.isActive() or self.current_step >= len(self.scenario.steps):
             return  # этап ещё не отрисован — вид не его
         cam = SceneBuilder.capture_camera(self.plotter)
@@ -1495,6 +1674,135 @@ class MainWindow(QMainWindow):
         self._update_camera_mark()
         self.mark_dirty()
         self.refresh_view(reset_camera=True)
+
+    # ------------------------------------------------------------- уточнения на листе этапа
+    def _cur_step_obj(self) -> Step | None:
+        if not self.model or self.current_step is None or self.show_all.isChecked():
+            return None
+        return self.scenario.steps[self.current_step] if self.current_step < len(self.scenario.steps) else None
+
+    def _update_details_bar(self):
+        while self.details_box.count():
+            w = self.details_box.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        step = self._cur_step_obj()
+        editing = self._editing_detail is not None
+        for j, d in enumerate(step.details if step else []):
+            text = lay.detail_label(j, d)
+            b = QPushButton(text if len(text) <= 24 else text[:23] + "…")
+            b.setToolTip(text + " — щёлкните: изменить вид, подпись, удалить")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setEnabled(not editing)
+            menu = QMenu(b)
+            menu.addAction("Изменить вид в 3D").triggered.connect(lambda _=False, j=j: self._start_detail_edit(j))
+            menu.addAction("Подпись…").triggered.connect(lambda _=False, j=j: self._rename_detail(j))
+            a = menu.addAction("Обводить место на общем виде")
+            a.setCheckable(True)
+            a.setChecked(d.mark)
+            a.toggled.connect(lambda on, j=j: self._set_detail_mark(j, on))
+            menu.addAction("Компоновка листа…").triggered.connect(lambda _=False, j=j: self.open_layout(j))
+            menu.addSeparator()
+            menu.addAction("Удалить").triggered.connect(lambda _=False, j=j: self._delete_detail(j))
+            b.setMenu(menu)
+            self.details_box.addWidget(b)
+        if step and not step.details:
+            self.details_box.addWidget(label("нет — на листе только общий вид", "hint"))
+        self.btn_add_detail.setEnabled(step is not None and not editing)
+        self.btn_layout.setEnabled(step is not None and not editing)
+        for w in (self.detail_edit_label, self.btn_detail_ok, self.btn_detail_cancel):
+            w.setVisible(editing)
+
+    def add_detail(self):
+        """Новое уточнение текущего этапа: крупный вид выделенного элемента или вид, настроенный вручную."""
+        step = self._cur_step_obj()
+        if step is None or self._editing_detail is not None:
+            self.statusBar().showMessage("Сначала выберите этап (снимите «Показать всю сборку»)", 5000)
+            return
+        self._remember_view()
+        nodes = [self.model.by_key[k] for k in self._selected_keys() if k in self.model.by_key]
+        cam = self.scene.zoom_camera(self.plotter, nodes) if nodes else None
+        d = Detail(camera=cam or SceneBuilder.capture_camera(self.plotter))
+        w, h = self.plotter.window_size
+        mark = lay.visible_mark(SceneBuilder._project(self.plotter, d.camera, (h, w))) if cam else None
+        d.rect = lay.free_rect([o.rect for o in step.details], mark)
+        step.details.append(d)
+        self.mark_dirty()
+        self._start_detail_edit(len(step.details) - 1, new=True, zoomed=bool(cam))
+
+    def _start_detail_edit(self, j, new=False, zoomed=True):
+        step = self._cur_step_obj()
+        if step is None or j >= len(step.details):
+            return
+        self._finish_detail_edit(True)
+        self._remember_view()
+        self._detail_back = SceneBuilder.capture_camera(self.plotter)
+        self._editing_detail = (self.current_step, j, new)
+        SceneBuilder.apply_camera(self.plotter, step.details[j].camera, self.scene.model_bounds())
+        self.plotter.render()
+        how = "проверьте вид" if zoomed else "приблизьте нужное место (колесо мыши), поверните"
+        self.detail_edit_label.setText(f"Вид {detail_letter(j)}: {how} в 3D и нажмите «Готово»")
+        self._update_details_bar()
+
+    def _finish_detail_edit(self, save: bool, layout: bool = False):
+        if self._editing_detail is None:
+            return
+        si, j, new = self._editing_detail
+        self._editing_detail = None
+        step = self.scenario.steps[si] if si < len(self.scenario.steps) else None
+        if step is not None and j < len(step.details):
+            if save:
+                cam = SceneBuilder.capture_camera(self.plotter)
+                if cam != step.details[j].camera:   # новый вид — обводка снова по нему
+                    step.details[j].mark_adj = [0.0, 0.0, 1.0]
+                step.details[j].camera = cam
+            elif new:
+                del step.details[j]
+            self.mark_dirty()
+        if self._detail_back and self.scene:
+            SceneBuilder.apply_camera(self.plotter, self._detail_back, self.scene.model_bounds())
+            self.plotter.render()
+        self._update_details_bar()
+        if layout and save and new and step is not None and si == self.current_step:
+            self.open_layout(j)
+
+    def _rename_detail(self, j):
+        step = self._cur_step_obj()
+        if step is None or j >= len(step.details):
+            return
+        d = step.details[j]
+        text, ok = QInputDialog.getText(self, APP_TITLE, f"Вид {detail_letter(j)}: подпись (можно пустую)", text=d.title)
+        if ok:
+            d.title = text.strip()
+            self.mark_dirty()
+            self._update_details_bar()
+
+    def _set_detail_mark(self, j, on):
+        step = self._cur_step_obj()
+        if step is not None and j < len(step.details):
+            step.details[j].mark = on
+            self.mark_dirty()
+
+    def _delete_detail(self, j):
+        step = self._cur_step_obj()
+        if step is not None and j < len(step.details):
+            del step.details[j]
+            self.mark_dirty()
+            self._update_details_bar()
+
+    def open_layout(self, j=0):
+        step = self._cur_step_obj()
+        if step is None:
+            return
+        self._remember_view()
+        from .layout import LayoutDialog
+        dlg = LayoutDialog(self, self.scenario, self.cls, self.scene, self.current_step, j)
+        if (getattr(dlg, "exec", None) or dlg.exec_)():
+            step.details = dlg.result_details
+            step.arrows = dlg.result_arrows
+            self.mark_dirty()
+            self._update_details_bar()
+            self.refresh_view()
 
     # ------------------------------------------------------------- 3D
     def refresh_view(self, reset_camera=False):
@@ -1535,6 +1843,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Экспорт PDF", base + ".pdf", "PDF (*.pdf)")
         if not path:
             return
+        self._finish_detail_edit(True)
         self._remember_view()
         self._update_camera_mark()
         self._cleanup_scenario()
