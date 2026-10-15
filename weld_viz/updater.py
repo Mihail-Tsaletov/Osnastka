@@ -1,15 +1,18 @@
-"""Проверка и установка обновлений.
+"""Обновление программы без прав администратора и без запуска других программ.
 
-Источник обновлений — файл update.json рядом с Osnastka.exe (если его нет — релизы GitHub по умолчанию):
-  {"github": "owner/repo"}                       релизы GitHub, в релизе файл Osnastka-<версия>.zip
-  {"github": "owner/repo", "token": "..."}       то же для закрытого репозитория (токен с правом чтения)
-  {"folder": "\\\\server\\share\\Osnastka"}      сетевая папка: latest.json + Osnastka-<версия>.zip
+Exe после установки не меняется (папка программы — только для чтения). Обновляется код: архив
+Osnastka-update-<версия>.zip (код программы + журнал NX + update.json) распаковывается в
+%LOCALAPPDATA%\\Osnastka\\app\\v<версия>, в app\\current.json записывается, какой код запускать.
+При следующем запуске загрузчик exe (osnastka.py) подключает этот код. Перезапуск — самой программой.
 
-Установка (только для собранного exe): новая версия распаковывается во временную папку и запускается
-с ключом --apply-update — ждёт закрытия старой, копирует себя на место установки и перезапускает программу.
-При запуске из исходников (есть папка .git) обновление — git pull.
+Откуда берутся архивы:
+  * папка обновлений (по умолчанию «Документы\\Osnastka\\Обновления»; её можно сменить) — сюда кладут архив
+    с флешки или из сетевой папки;
+  * релизы GitHub (если есть доступ в интернет) — тот же архив Osnastka-update-<версия>.zip.
+Архив один для сборок Windows 10/11 и Windows 7. Если коду нужны новые библиотеки (runtime больше,
+чем у установленного exe), установка не выполняется — нужна переустановка программы администратором.
 
-Модуль использует только стандартную библиотеку: его импортирует точка входа до загрузки Qt и VTK.
+Запуск из исходников (есть папка .git) — обновление через git pull.
 """
 from __future__ import annotations
 
@@ -28,113 +31,153 @@ from dataclasses import dataclass
 
 from . import __version__
 
-DEFAULT_CONFIG = {"github": "Mihail-Tsaletov/Osnastka"}
-# сборка для Windows 7 (Python 3.8 + Qt 5) обновляется своим архивом Osnastka-win7-<версия>.zip
-WIN7_BUILD = sys.version_info < (3, 9)
-ASSET_PREFIX = "Osnastka-win7-" if WIN7_BUILD else "Osnastka-"
-ASSET_RE = re.compile(r"^Osnastka-win7-\d[\d.]*\.zip$" if WIN7_BUILD else r"^Osnastka-\d[\d.]*\.zip$")
-EXE_NAME = "Osnastka.exe"
-APPLY_FLAG = "--apply-update"
+GITHUB_REPO = "Mihail-Tsaletov/Osnastka"
+PACKAGE_RE = re.compile(r"^Osnastka-update-(\d+(?:\.\d+){0,2})\.zip$", re.IGNORECASE)
 FROZEN = getattr(sys, "frozen", False)
 APP_DIR = os.path.dirname(sys.executable) if FROZEN else \
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+APPDATA = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "Osnastka")
+CODE_ROOT = os.path.join(APPDATA, "app")
+CURRENT = os.path.join(CODE_ROOT, "current.json")
+SETTINGS = os.path.join(APPDATA, "settings.json")
 WORK_DIR = os.path.join(tempfile.gettempdir(), "osnastka_update")
 NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW для git
 
 
 @dataclass
-class Release:
+class Package:
     version: str
-    url: str                 # ссылка (GitHub) или путь к zip (папка)
+    path: str                 # путь к zip (папка) или ссылка (GitHub)
     notes: str = ""
-    headers: dict | None = None
+    runtime: int = 1
+    source: str = "папка"
 
 
-def parse_version(v: str) -> tuple[int, int, int]:
-    nums = [int(x) for x in re.findall(r"\d+", v)[:3]]
+def parse_version(v: str) -> tuple:
+    nums = [int(x) for x in re.findall(r"\d+", str(v))[:3]]
     return tuple(nums + [0] * (3 - len(nums)))
 
 
-def load_config() -> dict:
-    path = os.path.join(APP_DIR, "update.json")
-    if os.path.exists(path):
-        with open(path, encoding="utf-8-sig") as f:
-            return json.load(f)
-    return dict(DEFAULT_CONFIG)
-
-
-def source_title() -> str:
-    if is_git_checkout():
-        return "git (" + APP_DIR + ")"
-    cfg = load_config()
-    return cfg["folder"] if "folder" in cfg else "GitHub " + cfg.get("github", "?")
-
-
-# ------------------------------------------------------------------ проверка
-def _get_json(url: str, headers: dict) -> dict:
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-
-def latest_release() -> Release | None:
-    """Последний опубликованный релиз (без сравнения версий)."""
-    cfg = load_config()
-    if "folder" in cfg:
-        info_path = os.path.join(cfg["folder"], "latest.json")
-        if not os.path.exists(info_path):
-            return None
-        with open(info_path, encoding="utf-8-sig") as f:
-            info = json.load(f)
-        file = info.get("file_win7") if WIN7_BUILD else info.get("file")
-        if not file:
-            return None
-        return Release(info["version"], os.path.join(cfg["folder"], file), info.get("notes", ""))
-
-    repo = cfg.get("github")
-    if not repo:
-        return None
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "Osnastka-updater"}
-    if cfg.get("token"):
-        headers["Authorization"] = "Bearer " + cfg["token"]
+def build_info() -> tuple[str, int]:
+    """(версия встроенного кода, runtime) установленного exe."""
     try:
-        data = _get_json(f"https://api.github.com/repos/{repo}/releases/latest", headers)
+        import osnastka_build
+        return osnastka_build.VERSION, int(osnastka_build.RUNTIME)
+    except Exception:
+        return __version__, 1
+
+
+def running_from_update() -> bool:
+    return bool(os.environ.get("OSNASTKA_CODE_DIR"))
+
+
+# ------------------------------------------------------------------ настройки
+def _settings() -> dict:
+    try:
+        with open(SETTINGS, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_settings(s: dict):
+    os.makedirs(APPDATA, exist_ok=True)
+    with open(SETTINGS, "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=1)
+
+
+def update_folder() -> str:
+    folder = _settings().get("update_folder")
+    if not folder:
+        from .paths import documents_dir
+        folder = os.path.join(documents_dir(), "Osnastka", "Обновления")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        pass
+    return folder
+
+
+def set_update_folder(folder: str):
+    s = _settings()
+    s["update_folder"] = folder
+    _save_settings(s)
+
+
+# ------------------------------------------------------------------ поиск архивов
+def read_package(path: str) -> Package | None:
+    """Сведения об архиве обновления (update.json внутри) или None, если это не архив обновления."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            info = json.loads(z.read("update.json").decode("utf-8-sig"))
+            if "weld_viz/__init__.py" not in z.namelist():
+                return None
+        return Package(str(info["version"]), path, info.get("notes", ""), int(info.get("runtime", 1)))
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return None
+
+
+def folder_packages(folder: str | None = None) -> list[Package]:
+    folder = folder or update_folder()
+    out = []
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return out
+    for name in names:
+        if PACKAGE_RE.match(name):
+            pkg = read_package(os.path.join(folder, name))
+            if pkg:
+                out.append(pkg)
+    out.sort(key=lambda p: parse_version(p.version), reverse=True)
+    return out
+
+
+def github_package() -> Package | None:
+    """Архив обновления последнего релиза GitHub (сетевые ошибки пробрасываются)."""
+    req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "Osnastka-updater"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return None  # релизов нет (или закрытый репозиторий без токена)
+            return None
         raise
-    asset = next((a for a in data.get("assets", []) if ASSET_RE.match(a["name"])), None)
-    if asset is None:
+    asset = next((a for a in data.get("assets", []) if PACKAGE_RE.match(a["name"])), None)
+    if not asset:
         return None
-    if cfg.get("token"):  # закрытый репозиторий: скачивание через API
-        url, dl_headers = asset["url"], dict(headers, Accept="application/octet-stream")
-    else:
-        url, dl_headers = asset["browser_download_url"], {"User-Agent": "Osnastka-updater"}
-    return Release(data.get("tag_name", "").lstrip("v"), url, data.get("body") or "", dl_headers)
+    return Package(data.get("tag_name", "").lstrip("v"), asset["browser_download_url"], data.get("body") or "",
+                   source="GitHub")
 
 
-def check() -> Release | None:
-    """Релиз новее установленной версии или None. Сетевые ошибки пробрасываются."""
-    rel = latest_release()
-    if rel and parse_version(rel.version) > parse_version(__version__):
-        return rel
-    return None
+def check(use_github: bool = True) -> Package | None:
+    """Самое свежее обновление новее работающего кода: из папки, затем (если доступен) с GitHub."""
+    current = parse_version(__version__)
+    best = next((p for p in folder_packages() if parse_version(p.version) > current), None)
+    if use_github and best is None:
+        try:
+            gh = github_package()
+            if gh and parse_version(gh.version) > current:
+                best = gh
+        except Exception:
+            pass   # нет интернета / GitHub закрыт — обычная ситуация на рабочих ПК
+    return best
 
 
-# ------------------------------------------------------------------ скачивание и установка
-def download(rel: Release, progress=None) -> str:
-    """Скачивает zip релиза во временную папку, возвращает путь."""
+# ------------------------------------------------------------------ установка
+def download(pkg: Package, progress=None) -> str:
+    """Скачать архив с GitHub во временную папку (архив из папки возвращается как есть)."""
+    if os.path.exists(pkg.path):
+        return pkg.path
     os.makedirs(WORK_DIR, exist_ok=True)
-    dest = os.path.join(WORK_DIR, f"{ASSET_PREFIX}{rel.version}.zip")
-    if os.path.exists(rel.url):
-        src, total = open(rel.url, "rb"), os.path.getsize(rel.url)
-    else:
-        resp = urllib.request.urlopen(urllib.request.Request(rel.url, headers=rel.headers or {}), timeout=30)
-        src, total = resp, int(resp.headers.get("Content-Length") or 0)
-    done = 0
-    with src, open(dest, "wb") as out:
+    dest = os.path.join(WORK_DIR, f"Osnastka-update-{pkg.version}.zip")
+    resp = urllib.request.urlopen(urllib.request.Request(pkg.path, headers={"User-Agent": "Osnastka-updater"}),
+                                  timeout=30)
+    total, done = int(resp.headers.get("Content-Length") or 0), 0
+    with resp, open(dest, "wb") as out:
         while True:
-            chunk = src.read(1 << 20)
+            chunk = resp.read(1 << 20)
             if not chunk:
                 break
             out.write(chunk)
@@ -144,75 +187,59 @@ def download(rel: Release, progress=None) -> str:
     return dest
 
 
-def start_install(zip_path: str):
-    """Распаковывает новую версию и запускает её установщиком. Вызывающий должен сразу завершиться."""
-    if not FROZEN:
-        raise RuntimeError("Установка из zip возможна только для собранной программы (Osnastka.exe)")
-    stage = os.path.join(WORK_DIR, "new")
+def install(zip_path: str) -> Package:
+    """Распаковать архив обновления в профиль пользователя и сделать его кодом для следующего запуска."""
+    pkg = read_package(zip_path)
+    if pkg is None:
+        raise RuntimeError("Это не архив обновления программы (нет update.json или кода программы).")
+    _, runtime = build_info()
+    if pkg.runtime > runtime:
+        raise RuntimeError(f"Версии {pkg.version} нужны новые библиотеки программы — её нужно установить заново "
+                           f"(с правами администратора), обновлением кода тут не обойтись.")
+    os.makedirs(CODE_ROOT, exist_ok=True)
+    name = "v" + pkg.version
+    final, stage = os.path.join(CODE_ROOT, name), os.path.join(CODE_ROOT, name + ".tmp")
     shutil.rmtree(stage, ignore_errors=True)
     with zipfile.ZipFile(zip_path) as z:
         z.extractall(stage)
-    new_exe = next((os.path.join(root, EXE_NAME) for root, _, files in os.walk(stage) if EXE_NAME in files), None)
-    if not new_exe:
-        raise RuntimeError(f"В архиве нет {EXE_NAME}")
-    subprocess.Popen([new_exe, APPLY_FLAG, APP_DIR, str(os.getpid())], close_fds=True,
-                     creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+    if not os.path.isfile(os.path.join(stage, "weld_viz", "__init__.py")):
+        shutil.rmtree(stage, ignore_errors=True)
+        raise RuntimeError("В архиве нет кода программы.")
+    shutil.rmtree(final, ignore_errors=True)
+    os.replace(stage, final)
+    with open(CURRENT, "w", encoding="utf-8") as f:
+        json.dump({"version": pkg.version, "dir": name, "runtime": pkg.runtime,
+                   "installed": time.strftime("%Y-%m-%d %H:%M:%S"), "from": zip_path}, f, ensure_ascii=False, indent=1)
+    _prune(keep={name, _running_dir_name()})
+    return pkg
 
 
-def _pid_alive(pid: int) -> bool:
-    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True,
-                         creationflags=NO_WINDOW).stdout
-    return str(pid) in out
+def revert_to_builtin():
+    """Отключить установленные обновления: со следующего запуска — код, встроенный в exe."""
+    try:
+        os.remove(CURRENT)
+    except OSError:
+        pass
 
 
-def _replace_dir(src: str, dst: str):
-    for attempt in range(20):  # файлы могут быть ещё заняты антивирусом/проводником
-        try:
-            if os.path.exists(dst):
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst)
-            return
-        except OSError:
-            time.sleep(0.5)
-    shutil.copytree(src, dst, dirs_exist_ok=True)
+def _running_dir_name() -> str:
+    d = os.environ.get("OSNASTKA_CODE_DIR")
+    return os.path.basename(d) if d else ""
 
 
-def apply_update(target_dir: str, old_pid: int):
-    """Выполняется НОВОЙ версией из временной папки: заменить файлы установленной и перезапустить."""
-    deadline = time.time() + 60
-    while _pid_alive(old_pid) and time.time() < deadline:
-        time.sleep(0.5)
-    time.sleep(0.5)
-    my_dir = os.path.dirname(sys.executable)
-    # всё содержимое новой версии: _internal, nx (журнал NX), DLL рядом с exe (сборка для Windows 7), exe;
-    # файлы пользователя в папке программы (update.json) не трогаются — их нет в новой версии
-    for name in os.listdir(my_dir):
-        src, dst = os.path.join(my_dir, name), os.path.join(target_dir, name)
-        if os.path.isdir(src):
-            _replace_dir(src, dst)
-            continue
-        for attempt in range(20):
-            try:
-                shutil.copy2(src, dst)
-                break
-            except OSError:
-                time.sleep(0.5)
-    subprocess.Popen([os.path.join(target_dir, EXE_NAME)], cwd=target_dir, close_fds=True,
-                     creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+def _prune(keep: set):
+    """Удалить старые версии кода (оставить текущую и работающую сейчас)."""
+    try:
+        for name in os.listdir(CODE_ROOT):
+            if name.startswith("v") and name not in keep and os.path.isdir(os.path.join(CODE_ROOT, name)):
+                shutil.rmtree(os.path.join(CODE_ROOT, name), ignore_errors=True)
+    except OSError:
+        pass
 
 
-def handle_apply_flag(argv: list[str]) -> bool:
-    """Вызывается точкой входа до загрузки интерфейса. True — это был запуск установщика."""
-    if len(argv) >= 4 and argv[1] == APPLY_FLAG:
-        apply_update(argv[2], int(argv[3]))
-        return True
-    return False
-
-
-def cleanup():
-    """Удаляет остатки прошлого обновления (вызывать при обычном запуске)."""
-    if FROZEN and not os.path.normcase(sys.executable).startswith(os.path.normcase(WORK_DIR)):
-        shutil.rmtree(WORK_DIR, ignore_errors=True)
+def restart_command() -> list[str]:
+    """Как перезапустить программу: тот же exe (другие программы не запускаются)."""
+    return [sys.executable] if FROZEN else [sys.executable, "-m", "weld_viz"]
 
 
 # ------------------------------------------------------------------ запуск из исходников: git

@@ -14,12 +14,12 @@ from .scenario import Scenario
 from .scene import SceneBuilder
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="PDF-инструкция закладки по сценарию")
     ap.add_argument("scenario")
     ap.add_argument("-o", "--output")
     ap.add_argument("--reexport", action="store_true", help="заново выгрузить сборку из NX")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     sc = Scenario.load(a.scenario)
     if a.reexport or not nx_bridge.is_export_fresh(sc.model):

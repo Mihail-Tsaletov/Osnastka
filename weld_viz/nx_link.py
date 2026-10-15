@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 
 APPDATA = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "Osnastka")
@@ -17,7 +18,13 @@ REQUEST = os.path.join(INBOX, "request.json")
 APP_DIR = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
            else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 JOURNAL_DIR = os.path.join(APP_DIR, "nx")
-JOURNAL = os.path.join(JOURNAL_DIR, "osnastka_nx.cs")
+# после обновления кода (архивом) свежий журнал — в папке обновления, а папка программы не меняется
+_CODE_DIR = os.environ.get("OSNASTKA_CODE_DIR")
+JOURNAL = next((j for j in ([os.path.join(_CODE_DIR, "nx", "osnastka_nx.cs")] if _CODE_DIR else []) +
+                [os.path.join(JOURNAL_DIR, "osnastka_nx.cs")] if os.path.exists(j)),
+               os.path.join(JOURNAL_DIR, "osnastka_nx.cs"))
+# копия для кнопки в NX — постоянный путь, обновляется при каждом запуске программы
+BUTTON_JOURNAL = os.path.join(APPDATA, "nx", "osnastka_nx.cs")
 TC_PREFIX = "tc:"   # модель из Teamcenter: в сценарии вместо пути к файлу — "tc:<номер>/<ревизия>"
 
 
@@ -58,6 +65,12 @@ def register_app():
         exe, args = (pyw if os.path.exists(pyw) else sys.executable), "-m weld_viz"
     with open(os.path.join(APPDATA, "app_launch.txt"), "w", encoding="utf-8") as f:
         f.write(f"{os.getpid()}\n{exe}\n{args}\n{APP_DIR}\n")
+    try:   # свежая копия журнала для кнопки в NX
+        os.makedirs(os.path.dirname(BUTTON_JOURNAL), exist_ok=True)
+        if os.path.exists(JOURNAL):
+            shutil.copy2(JOURNAL, BUTTON_JOURNAL)
+    except OSError:
+        pass
 
 
 def take_request() -> dict | None:
