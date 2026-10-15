@@ -65,6 +65,11 @@ def main():
         text = f.read()
     with open(INIT, "w", encoding="utf-8") as f:
         f.write(re.sub(r'__version__ = "[^"]*"', f'__version__ = "{a.version}"', text))
+    build_py = os.path.join(ROOT, "osnastka_build.py")   # версия встроенного в exe кода — для загрузчика
+    with open(build_py, encoding="utf-8") as f:
+        text = f.read()
+    with open(build_py, "w", encoding="utf-8") as f:
+        f.write(re.sub(r'VERSION = "[^"]*"', f'VERSION = "{a.version}"', text))
 
     # сборка и архив (обычная — Windows 10/11)
     run(sys.executable, "-m", "PyInstaller", "--noconfirm", "--log-level", "WARN", "Osnastka.spec")
@@ -81,6 +86,13 @@ def main():
         zips.append(win7_zip)
     else:
         print("! Нет .venv38 — сборка для Windows 7 пропущена")
+    # архив обновления кода — для программ, установленных без права на запись (обновление из папки)
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    from make_update import make_update
+    zips.append(make_update(DIST, a.notes))
+    # установщики (Program Files, ярлыки, удаление) — для первой установки с правами администратора
+    from make_installer import make_all
+    zips += make_all(DIST)
 
     # коммит и тег
     run("git", "commit", "-q", "-am", f"Версия {a.version}" + (f"\n\n{a.notes}" if a.notes else ""))
